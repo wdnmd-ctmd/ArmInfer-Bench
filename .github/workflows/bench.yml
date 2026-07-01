@@ -1,7 +1,8 @@
-name: Arm64 Bench (naive baseline)
+name: Arm64 Bench (T2 five-variant matrix)
 
-# W1 = T0 + T1. Source of truth: .trae/specs/bootstrap-arm-infer-bench/spec.md
-# This workflow lands the naive smoke baseline on ubuntu-24.04-arm.
+# W2 = T2. Source of truth: .trae/specs/bootstrap-arm-infer-bench/spec.md
+# 五档 × 两量化 = 10 次基准,严格遵守 NF4 同机对照(同 job 同 runner 连续跑完)。
+# 总监 W2 护栏:G1 探针交叉验证(不许循环论证)/ G2 Q4_0 双优化交互注明 / G3 50min 红线。
 
 on:
   push:
@@ -14,10 +15,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  # contents: write so the job can commit results/*.json back to main (durable baseline record, NF1).
+  # contents: write so the job can commit results/*.json + comparison tables back to main (NF1).
   contents: write
 
-# Cancel superseded in-flight runs on the same ref (T1.3).
 concurrency:
   group: bench-${{ github.ref }}
   cancel-in-progress: true
@@ -25,11 +25,15 @@ concurrency:
 env:
   # Pinned llama.cpp commit (release b9728, 2026-06-19). T1.6 verified repack mechanism here.
   LLAMA_COMMIT: fabde3bf5136940eb03821aa2490e2360093965b
-  # Pinned GGUF (HuggingFace resolve/<REV>/<file>) + expected sha256 (T1.8).
+  # Pinned GGUFs (HuggingFace resolve/<REV>/<file>).
   GGUF_REPO: Qwen/Qwen2.5-1.5B-Instruct-GGUF
   GGUF_REV: 91cad51170dc346986eccefdc2dd33a9da36ead9
-  GGUF_FILE: qwen2.5-1.5b-instruct-q4_k_m.gguf
-  GGUF_SHA256: 6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e
+  # Q4_K_M (T1 baseline, known sha256).
+  GGUF_FILE_Q4_K_M: qwen2.5-1.5b-instruct-q4_k_m.gguf
+  GGUF_SHA256_Q4_K_M: 6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e
+  # Q4_0 (T2 new — sha256 verified on first CI download, recorded into JSON + $GITHUB_ENV).
+  GGUF_FILE_Q4_0: qwen2.5-1.5b-instruct-q4_0.gguf
+  GGUF_SHA256_Q4_0: ""
   # Pinned bench args (NF3).
   BENCH_THREADS: 4
   BENCH_PP: 512
@@ -37,14 +41,14 @@ env:
   BENCH_REPS: 5
 
 jobs:
-  naive-baseline:
+  five-variant-matrix:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4.2.2
 
-      - name: CPU features self-evidence (T1.4)
+      - name: CPU features self-evidence (T1.4 / NF4 anchor)
         id: cpu
         run: |
           echo "::group::CPU info"
@@ -55,9 +59,13 @@ jobs:
           FEATURES="$(grep -m1 '^Features' /proc/cpuinfo | cut -d: -f2 | xargs)"
           CPU_IMPL="$(grep -m1 '^CPU implementer' /proc/cpuinfo | awk '{print $3}')"
           CPU_PART="$(grep -m1 '^CPU part'     /proc/cpuinfo | awk '{print $3}')"
+          # Map implementer/part to friendly name (非阻塞:0xd49 -> Neoverse-N2).
+          CPU_NAME="unknown"
+          if [ "$CPU_IMPL" = "0x41" ] && [ "$CPU_PART" = "0xd49" ]; then CPU_NAME="Neoverse-N2"; fi
           echo "cpu_features=${FEATURES}" >> "$GITHUB_OUTPUT"
           echo "cpu_impl=${CPU_IMPL}"       >> "$GITHUB_OUTPUT"
           echo "cpu_part=${CPU_PART}"       >> "$GITHUB_OUTPUT"
+          echo "cpu_name=${CPU_NAME}"       >> "$GITHUB_OUTPUT"
           echo ""
           echo "Feature presence (asimddp=dotprod, i8mm, sve2):"
           for f in asimddp i8mm sve2; do
@@ -72,231 +80,335 @@ jobs:
           RUNNER_OS="$(. /etc/os-release && echo "${PRETTY_NAME}")"
           echo "compiler=${COMPILER}"   >> "$GITHUB_OUTPUT"
           echo "runner_os=${RUNNER_OS}" >> "$GITHUB_OUTPUT"
-          {
-            echo "=== compiler ==="; cc --version | head -1
-            echo "=== runner os ==="; cat /etc/os-release
-          } | sed 's/^/  /'
+          { echo "=== compiler ==="; cc --version | head -1; echo "=== runner os ==="; cat /etc/os-release; } | sed 's/^/  /'
 
-      - name: Install ccache (T1.5)
+      - name: Install ccache + binutils (nm probe needs binutils)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ccache
+          sudo apt-get install -y -qq ccache binutils
 
-      - name: Configure ccache cache (T1.5)
+      - name: Configure ccache cache (shared across all 5 variants, G3)
         uses: actions/cache@v4.2.0
         with:
           path: ~/.ccache
-          key: ccache-arm64-naive-${{ env.LLAMA_COMMIT }}-${{ github.sha }}
+          key: ccache-arm64-matrix-${{ env.LLAMA_COMMIT }}-${{ github.sha }}
           restore-keys: |
-            ccache-arm64-naive-${{ env.LLAMA_COMMIT }}-
+            ccache-arm64-matrix-${{ env.LLAMA_COMMIT }}-
 
-      - name: Fetch llama.cpp at pinned commit (T1.1)
-        run: |
-          bash scripts/fetch_llamacpp.sh
-          echo "llama_commit=$(git -C third_party/llama.cpp rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Fetch llama.cpp at pinned commit (T1.1, reused)
+        run: bash scripts/fetch_llamacpp.sh
 
-      - name: Restore GGUF cache (T1.8)
-        id: gguf-cache
+      - name: Restore GGUF Q4_K_M cache
+        id: gguf-q4km-cache
         uses: actions/cache@v4.2.0
         with:
-          path: models/${{ env.GGUF_FILE }}
-          key: gguf-${{ env.GGUF_FILE }}-${{ env.GGUF_REV }}
+          path: models/${{ env.GGUF_FILE_Q4_K_M }}
+          key: gguf-${{ env.GGUF_FILE_Q4_K_M }}-${{ env.GGUF_REV }}
 
-      - name: Download GGUF + sha256 verify (T1.8)
-        if: steps.gguf-cache.outputs.cache-hit != 'true'
+      - name: Restore GGUF Q4_0 cache
+        id: gguf-q40-cache
+        uses: actions/cache@v4.2.0
+        with:
+          path: models/${{ env.GGUF_FILE_Q4_0 }}
+          key: gguf-${{ env.GGUF_FILE_Q4_0 }}-${{ env.GGUF_REV }}
+
+      - name: Download GGUFs + sha256 verify
         run: |
           mkdir -p models
-          URL="https://huggingface.co/${GGUF_REPO}/resolve/${GGUF_REV}/${GGUF_FILE}"
-          echo "Downloading ${URL}"
-          curl -fL --retry 5 --retry-delay 3 --connect-timeout 30 -o "models/${GGUF_FILE}" "${URL}"
-          ACTUAL="$(sha256sum "models/${GGUF_FILE}" | awk '{print $1}')"
-          echo "expected sha256: ${GGUF_SHA256}"
-          echo "actual   sha256: ${ACTUAL}"
-          if [ "${ACTUAL}" != "${GGUF_SHA256}" ]; then
-            echo "::error::GGUF sha256 mismatch"
-            exit 1
+          # Q4_K_M (known sha256, strict verify).
+          if [ ! -f "models/${GGUF_FILE_Q4_K_M}" ]; then
+            URL="https://huggingface.co/${GGUF_REPO}/resolve/${GGUF_REV}/${GGUF_FILE_Q4_K_M}"
+            echo "Downloading ${URL}"
+            curl -fL --retry 5 --retry-delay 3 --connect-timeout 30 -o "models/${GGUF_FILE_Q4_K_M}" "${URL}"
           fi
-          echo "GGUF verified."
-
-      - name: Build naive variant (T1.7)
-        run: |
-          cmake -S third_party/llama.cpp -B third_party/llama.cpp/build \
-            -DGGML_NATIVE=OFF \
-            -DGGML_CPU_ARM_ARCH=armv8-a \
-            -DGGML_CPU_KLEIDIAI=OFF \
-            -DGGML_CPU_REPACK=OFF \
-            -DGGML_CCACHE=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
-          cmake --build third_party/llama.cpp/build --target llama-bench -j"$(nproc)"
-          echo "=== llama-bench binary ==="
-          third_party/llama.cpp/build/bin/llama-bench --version || true
-
-      - name: Run llama-bench + capture peak memory (T1.9, T1.10)
-        run: |
-          mkdir -p results
-          BENCH_BIN="third_party/llama.cpp/build/bin/llama-bench"
-          # /usr/bin/time -v wraps llama-bench as the MAIN method for peak RSS (NF3).
-          # stdout (llama-bench -o json) -> bench_raw.json ; stderr (time -v stats) -> time_stderr.txt
-          set +e
-          /usr/bin/time -v "${BENCH_BIN}" \
-            -t "${BENCH_THREADS}" -p "${BENCH_PP}" -n "${BENCH_TG}" -r "${BENCH_REPS}" \
-            -m "models/${GGUF_FILE}" \
-            -o json > bench_raw.json 2> time_stderr.txt
-          RC=$?
-          set -e
-          echo "=== llama-bench raw JSON (stdout) ==="
-          cat bench_raw.json
-          echo ""
-          echo "=== /usr/bin/time -v stats (stderr) ==="
-          cat time_stderr.txt
-          echo ""
-          if [ $RC -ne 0 ]; then
-            echo "::error::llama-bench exited with code ${RC}"
-            exit $RC
+          ACTUAL="$(sha256sum "models/${GGUF_FILE_Q4_K_M}" | awk '{print $1}')"
+          echo "Q4_K_M expected sha256: ${GGUF_SHA256_Q4_K_M}"
+          echo "Q4_K_M actual   sha256: ${ACTUAL}"
+          if [ "${ACTUAL}" != "${GGUF_SHA256_Q4_K_M}" ]; then echo "::error::Q4_K_M sha256 mismatch"; exit 1; fi
+          # Q4_0 (sha256 unknown a priori — compute on first download, record to $GITHUB_ENV).
+          if [ ! -f "models/${GGUF_FILE_Q4_0}" ]; then
+            URL="https://huggingface.co/${GGUF_REPO}/resolve/${GGUF_REV}/${GGUF_FILE_Q4_0}"
+            echo "Downloading ${URL}"
+            curl -fL --retry 5 --retry-delay 3 --connect-timeout 30 -o "models/${GGUF_FILE_Q4_0}" "${URL}"
           fi
+          Q40_SHA="$(sha256sum "models/${GGUF_FILE_Q4_0}" | awk '{print $1}')"
+          echo "Q4_0 actual sha256: ${Q40_SHA}"
+          echo "gguf_sha256_q4_0=${Q40_SHA}" >> "$GITHUB_ENV"
+          echo "GGUFs verified/present."
 
-      - name: Assemble result JSON (T1.11, T1.12, T1.14)
+      - name: Build 5 variants (serial, same runner — NF4)
         run: |
-          python3 - <<'PY'
+          for V in naive norepack repack kleidiai_only kleidiai; do
+            echo "=== building variant: $V ==="
+            bash scripts/build_variant.sh "$V" third_party/llama.cpp "third_party/llama.cpp/build-$V"
+          done
+
+      - name: Run 10 benchmarks (5 variants × 2 quants, -v for runtime probes — G1)
+        run: |
+          mkdir -p bench_logs
+          for V in naive norepack repack kleidiai_only kleidiai; do
+            for Q in q4_k_m q4_0; do
+              if [ "$Q" = "q4_k_m" ]; then MODEL="models/${GGUF_FILE_Q4_K_M}"; else MODEL="models/${GGUF_FILE_Q4_0}"; fi
+              BENCH_BIN="third_party/llama.cpp/build-$V/bin/llama-bench"
+              TAG="${V}__${Q}"
+              echo "::group::bench $TAG"
+              # G1: raise log level + -v to surface repack/kleidiai DEBUG runtime evidence.
+              # stderr holds BOTH time -v stats (printed at exit) AND llama-bench -v verbose log.
+              set +e
+              /usr/bin/time -v env GGML_LOG_LEVEL=DEBUG GGML_DEBUG=1 \
+                "$BENCH_BIN" \
+                -t "${BENCH_THREADS}" -p "${BENCH_PP}" -n "${BENCH_TG}" -r "${BENCH_REPS}" \
+                -m "$MODEL" -o json -v \
+                > "bench_logs/bench_${TAG}.json" 2> "bench_logs/all_${TAG}.stderr"
+              RC=$?
+              set -e
+              echo "rc=$RC"
+              if [ $RC -ne 0 ]; then
+                echo "::error::llama-bench $TAG exited $RC"
+                echo "=== stderr ==="; cat "bench_logs/all_${TAG}.stderr"
+                exit $RC
+              fi
+              echo "=== bench_${TAG}.json (stdout) ==="; cat "bench_logs/bench_${TAG}.json"
+              echo "=== all_${TAG}.stderr (time -v + verbose) tail ==="; tail -60 "bench_logs/all_${TAG}.stderr"
+              echo "::endgroup::"
+            done
+          done
+
+      - name: Assemble 10 result JSONs + 2 comparison tables (probes G1 cross-validated)
+        run: |
+          python3 - <<'PYEOF'
           import json, os, re, subprocess, datetime, pathlib, sys
 
           def sh(cmd):
               return subprocess.check_output(cmd, shell=True, text=True).strip()
 
-          # --- CPU info (re-derive for self-containment) ---
+          # --- CPU info + friendly name (非阻塞:0xd49 -> Neoverse-N2) ---
           cpuinfo = pathlib.Path('/proc/cpuinfo').read_text()
-          feats = ''
-          impl = part = ''
+          feats = impl = part = ''
           for line in cpuinfo.splitlines():
-              if line.startswith('Features'):
-                  feats = line.split(':',1)[1].strip()
-              elif line.startswith('CPU implementer'):
-                  impl = line.split(':',1)[1].strip().split()[-1]
-              elif line.startswith('CPU part'):
-                  part = line.split(':',1)[1].strip().split()[-1]
-          cpu_model = f"implementer={impl} part={part}"
+              if line.startswith('Features'):         feats = line.split(':',1)[1].strip()
+              elif line.startswith('CPU implementer'): impl = line.split(':',1)[1].strip().split()[-1]
+              elif line.startswith('CPU part'):       part = line.split(':',1)[1].strip().split()[-1]
+          name_map = {('0x41','0xd49'): 'Neoverse-N2'}
+          cpu_name = name_map.get((impl, part), 'unknown')
+          cpu_model = f"{cpu_name} (implementer={impl} part={part})"
 
-          # --- compiler / runner_os ---
           compiler = sh("cc --version | head -1")
           runner_os = ""
-          try:
-              for line in pathlib.Path('/etc/os-release').read_text().splitlines():
-                  if line.startswith('PRETTY_NAME='):
-                      runner_os = line.split('=',1)[1].strip().strip('"')
-          except Exception:
-              runner_os = "unknown"
-
-          # --- llama commit ---
+          for line in pathlib.Path('/etc/os-release').read_text().splitlines():
+              if line.startswith('PRETTY_NAME='):
+                  runner_os = line.split('=',1)[1].strip().strip('"')
           llama_commit = sh("git -C third_party/llama.cpp rev-parse HEAD")
 
-          # --- parse llama-bench JSON ---
-          raw = pathlib.Path('bench_raw.json').read_text().strip()
-          if not raw:
-              print("::error::empty llama-bench output"); sys.exit(1)
-          rows = json.loads(raw)
-          def getf(r, *names):
-              for n in names:
-                  if n in r and r[n] not in (None, ""):
-                      return r[n]
-              return None
-          # b9728 llama-bench JSON: each row is ONE test (pp OR tg), throughput in
-          # avg_ts/stddev_ts. pp test: n_prompt>0,n_gen=0 ; tg test: n_prompt=0,n_gen>0.
-          prefill_avg = prefill_sd = decode_avg = decode_sd = None
-          for r in rows:
-              avg_ts = r.get('avg_ts')
-              stddev_ts = r.get('stddev_ts')
-              n_p = r.get('n_prompt', 0) or 0
-              n_g = r.get('n_gen', 0) or 0
-              if avg_ts is None:
-                  continue
-              if n_p > 0 and prefill_avg is None:
-                  prefill_avg = float(avg_ts); prefill_sd = float(stddev_ts or 0)
-              elif n_g > 0 and decode_avg is None:
-                  decode_avg = float(avg_ts); decode_sd = float(stddev_ts or 0)
-          if prefill_avg is None or decode_avg is None:
-              print("::error::could not parse avg_ts (prefill/decode) from llama-bench JSON")
-              print("raw rows:", rows); sys.exit(1)
-
-          # --- peak memory from /usr/bin/time -v ---
-          time_stderr = pathlib.Path('time_stderr.txt').read_text()
-          m = re.search(r'Maximum resident set size \(kbytes\)\s*:\s*(\d+)', time_stderr)
-          if not m:
-              print("::error::could not find 'Maximum resident set size' in time -v output"); sys.exit(1)
-          peak_mem_mb = round(int(m.group(1)) / 1024.0, 2)
-          peak_mem_source = "time_v_maxrss"
-
-          # --- TTFT (NF3) ---
-          pp_n = int(os.environ['BENCH_PP'])
-          tg_n = int(os.environ['BENCH_TG'])
-          reps = int(os.environ['BENCH_REPS'])
-          n_threads = int(os.environ['BENCH_THREADS'])
+          pp_n = int(os.environ['BENCH_PP']); tg_n = int(os.environ['BENCH_TG'])
+          reps = int(os.environ['BENCH_REPS']); n_threads = int(os.environ['BENCH_THREADS'])
           ttft_formula = "ttft_ms = pp_n / prefill_tok_s * 1000"
-          ttft_ms = round(pp_n / prefill_avg * 1000.0, 3)
 
-          # --- stddev alert (>10% of avg) ---
-          for name, avg, sd in (("prefill", prefill_avg, prefill_sd), ("decode", decode_avg, decode_sd)):
-              if avg > 0 and sd / avg > 0.10:
-                  print(f"::warning::{name} stddev/avg = {sd/avg*100:.2f}% > 10% threshold")
-
-          # --- model size ---
-          gguf_path = pathlib.Path('models') / os.environ['GGUF_FILE']
-          model_size_mb = round(gguf_path.stat().st_size / (1024*1024), 2)
+          variants = ["naive","norepack","repack","kleidiai_only","kleidiai"]
+          quants   = ["q4_k_m","q4_0"]
+          gguf_file = {"q4_k_m": os.environ['GGUF_FILE_Q4_K_M'],
+                       "q4_0":   os.environ['GGUF_FILE_Q4_0']}
+          gguf_sha  = {"q4_k_m": os.environ['GGUF_SHA256_Q4_K_M'],
+                       "q4_0":   os.environ.get('gguf_sha256_q4_0','')}
 
           ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-          result = {
-            "variant": "naive",
-            "quant": "Q4_K_M",
-            "model": "Qwen2.5-1.5B-Instruct",
-            "model_revision": os.environ['GGUF_REV'],
-            "model_sha256": os.environ['GGUF_SHA256'],
-            "model_size_mb": model_size_mb,
-            "bench_args": f"-t {n_threads} -p {pp_n} -n {tg_n} -r {reps}",
-            "pp_n": pp_n, "tg_n": tg_n, "reps": reps,
-            "prefill_tok_s": prefill_avg, "prefill_stddev": prefill_sd,
-            "decode_tok_s": decode_avg, "decode_stddev": decode_sd,
-            "ttft_ms": ttft_ms, "ttft_formula": ttft_formula,
-            "peak_mem_mb": peak_mem_mb, "peak_mem_source": peak_mem_source,
-            "n_threads": n_threads,
-            "cpu_model": cpu_model,
-            "cpu_features": feats,
-            "compiler": compiler,
-            "llama_commit": llama_commit,
-            "runner_os": runner_os,
-            "timestamp": ts,
-          }
-
           pathlib.Path('results').mkdir(exist_ok=True)
-          out = pathlib.Path('results') / f"{ts}-naive-q4_k_m.json"
-          out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding='utf-8')
-          print("=== RESULT JSON (baseline, for director review) ===")
-          print(out.read_text(encoding='utf-8'))
-          print(f"=== written to {out} ===")
-          PY
+          records = {}
 
-      - name: Upload artifacts (T1.13)
+          for V in variants:
+              for Q in quants:
+                  tag = f"{V}__{Q}"
+                  raw = pathlib.Path(f"bench_logs/bench_{tag}.json").read_text().strip()
+                  if not raw:
+                      print(f"::error::empty llama-bench output for {tag}"); sys.exit(1)
+                  rows = json.loads(raw)
+                  # b9728 llama-bench JSON: each row ONE test (pp OR tg), throughput in avg_ts/stddev_ts.
+                  prefill_avg = prefill_sd = decode_avg = decode_sd = None
+                  for r in rows:
+                      avg_ts = r.get('avg_ts'); stddev_ts = r.get('stddev_ts')
+                      n_p = r.get('n_prompt',0) or 0; n_g = r.get('n_gen',0) or 0
+                      if avg_ts is None: continue
+                      if n_p > 0 and prefill_avg is None:
+                          prefill_avg = float(avg_ts); prefill_sd = float(stddev_ts or 0)
+                      elif n_g > 0 and decode_avg is None:
+                          decode_avg = float(avg_ts); decode_sd = float(stddev_ts or 0)
+                  if prefill_avg is None or decode_avg is None:
+                      print(f"::error::could not parse avg_ts for {tag}"); print(rows); sys.exit(1)
+
+                  # Peak mem from time -v (line lives at end of combined stderr).
+                  stderr_txt = pathlib.Path(f"bench_logs/all_{tag}.stderr").read_text(errors='replace')
+                  m = re.search(r'Maximum resident set size \(kbytes\)\s*:\s*(\d+)', stderr_txt)
+                  if not m:
+                      print(f"::error::no peak RSS for {tag}"); sys.exit(1)
+                  peak_mem_mb = round(int(m.group(1))/1024.0, 2)
+
+                  for nm,avg,sd in (("prefill",prefill_avg,prefill_sd),("decode",decode_avg,decode_sd)):
+                      if avg>0 and sd/avg>0.10:
+                          print(f"::warning::{tag} {nm} stddev/avg={sd/avg*100:.2f}% >10%")
+
+                  # ===== Activation probes (G1: cross-validate, never circular) =====
+                  probe_build = pathlib.Path(f"third_party/llama.cpp/build-{V}/probe_build.txt").read_text(errors='replace')
+                  def probe_val(key):
+                      mt = re.search(rf'^{key}=(.*)$', probe_build, re.M)
+                      return mt.group(1).strip() if mt else ''
+                  nm_count = int(probe_val('kleidiai_compiled_nm_count') or 0)
+                  kleidiai_compiled = nm_count > 0
+                  repack_cmake = probe_val('repack_cmake_state')
+                  kleidiai_cmake = probe_val('kleidiai_cmake_state')
+
+                  # Runtime probes from verbose stderr (G1: prefer real runtime evidence).
+                  repack_msgs = re.findall(r'repack tensor', stderr_txt, re.I)
+                  kleidiai_lines = [l for l in stderr_txt.splitlines() if re.search(r'kleidiai', l, re.I)]
+                  kleidiai_runtime_kernel = any(re.search(r'(kernel|buffer|select|primary|registered|init)', l, re.I) for l in kleidiai_lines)
+                  # tensors_offloaded: try parse a count from kleidiai buffer allocation lines.
+                  offloaded = -1
+                  om = re.search(r'kleidiai[^\n]*?(\d+)\s*tensor', stderr_txt, re.I)
+                  if om: offloaded = int(om.group(1))
+
+                  # repack_active: runtime log wins; cmake_inferred ONLY last-resort fallback (G1).
+                  if repack_msgs:
+                      repack_active = True; repack_active_source = "verbose_log"
+                  elif repack_cmake == "ON":
+                      repack_active = True; repack_active_source = "cmake_inferred"
+                  else:
+                      repack_active = False; repack_active_source = "cmake_off"
+
+                  # kleidiai_active: runtime log wins; compiled_inferred ONLY last-resort (G1).
+                  if kleidiai_lines and kleidiai_runtime_kernel:
+                      kleidiai_active = True; kleidiai_active_source = "verbose_log"
+                  elif not kleidiai_lines:
+                      if kleidiai_compiled and Q in ("q4_0","q8_0"):
+                          kleidiai_active = False; kleidiai_active_source = "inconclusive_no_runtime_msg"
+                      elif not kleidiai_compiled:
+                          kleidiai_active = False; kleidiai_active_source = "no_kleidiai_in_build"
+                      else:
+                          kleidiai_active = False; kleidiai_active_source = "kquant_noop_expected"
+                  else:
+                      kleidiai_active = False; kleidiai_active_source = "inconclusive_lines_present"
+
+                  if offloaded < 0:
+                      offloaded = 0 if not kleidiai_active else -1
+
+                  model_size_mb = round(pathlib.Path('models', gguf_file[Q]).stat().st_size/(1024*1024), 2)
+                  ttft_ms = round(pp_n/prefill_avg*1000.0, 3)
+
+                  result = {
+                      "variant": V, "quant": Q.upper(),
+                      "model": "Qwen2.5-1.5B-Instruct",
+                      "model_revision": os.environ['GGUF_REV'],
+                      "model_sha256": gguf_sha[Q],
+                      "model_size_mb": model_size_mb,
+                      "bench_args": f"-t {n_threads} -p {pp_n} -n {tg_n} -r {reps}",
+                      "pp_n": pp_n, "tg_n": tg_n, "reps": reps,
+                      "prefill_tok_s": prefill_avg, "prefill_stddev": prefill_sd,
+                      "decode_tok_s": decode_avg, "decode_stddev": decode_sd,
+                      "ttft_ms": ttft_ms, "ttft_formula": ttft_formula,
+                      "peak_mem_mb": peak_mem_mb, "peak_mem_source": "time_v_maxrss",
+                      "n_threads": n_threads, "cpu_model": cpu_model, "cpu_features": feats,
+                      "compiler": compiler, "llama_commit": llama_commit, "runner_os": runner_os,
+                      "timestamp": ts,
+                      # T2 activation probes (4 fields, G1 cross-validated).
+                      "kleidiai_compiled": kleidiai_compiled,
+                      "kleidiai_active": kleidiai_active,
+                      "kleidiai_tensors_offloaded": offloaded,
+                      "repack_active": repack_active,
+                      # Probe sources (G1: verbose_log=real runtime evidence; *_inferred=last-resort
+                      # fallback NEVER alone sufficient for active; inconclusive_* = no hard assertion).
+                      "kleidiai_active_source": kleidiai_active_source,
+                      "repack_active_source": repack_active_source,
+                      "kleidiai_compiled_nm_count": nm_count,
+                      "repack_cmake_state": repack_cmake,
+                      "kleidiai_cmake_state": kleidiai_cmake,
+                  }
+                  out = pathlib.Path('results')/f"{ts}-{V}-{Q}.json"
+                  out.write_text(json.dumps(result, ensure_ascii=False, indent=2)+"\n", encoding='utf-8')
+                  records[(V,Q)] = result
+                  print(f"=== {tag} ===")
+                  print(json.dumps({k:result[k] for k in ('variant','quant','prefill_tok_s','decode_tok_s','ttft_ms','peak_mem_mb','kleidiai_compiled','kleidiai_active','kleidiai_tensors_offloaded','repack_active','kleidiai_active_source','repack_active_source')}, ensure_ascii=False, indent=2))
+
+          # ===== Generate 2 comparison tables (one per quant) + G1 behavior cross-check =====
+          def speedup(a, b): return round(a/b, 3) if b else None
+          for Q in quants:
+              naive = records[("naive", Q)]
+              lines = []
+              lines.append(f"# 同机对照表:{Q.upper()} (NF4 — 同 job 同 runner,分母 = 本 job naive-{Q})")
+              lines.append("")
+              lines.append(f"runner cpu: {naive['cpu_model']} | llama_commit: {naive['llama_commit']} | timestamp: {ts}")
+              lines.append("")
+              lines.append("| variant | prefill tok/s | decode tok/s | TTFT ms | peak mem MB | k_compiled | k_active | offloaded | repack_active | pp speedup | tg speedup | ttft ratio | mem ratio | probe sources |")
+              lines.append("|---------|---------------|--------------|---------|-------------|------------|----------|-----------|---------------|------------|------------|-----------|-----------|---------------|")
+              for V in variants:
+                  r = records[(V,Q)]
+                  ps = speedup(r['prefill_tok_s'], naive['prefill_tok_s'])
+                  ds = speedup(r['decode_tok_s'], naive['decode_tok_s'])
+                  tr = speedup(r['ttft_ms'], naive['ttft_ms'])
+                  mr = speedup(r['peak_mem_mb'], naive['peak_mem_mb'])
+                  src = f"k:{r['kleidiai_active_source']}; r:{r['repack_active_source']}"
+                  lines.append(f"| {V} | {r['prefill_tok_s']:.3f} | {r['decode_tok_s']:.3f} | {r['ttft_ms']:.1f} | {r['peak_mem_mb']:.1f} | {r['kleidiai_compiled']} | {r['kleidiai_active']} | {r['kleidiai_tensors_offloaded']} | {r['repack_active']} | {ps} | {ds} | {tr} | {mr} | {src} |")
+              # G1 behavior cross-check (kleidiai_only vs norepack).
+              npp = records[("norepack",Q)]['prefill_tok_s']
+              kpp = records[("kleidiai_only",Q)]['prefill_tok_s']
+              ntg = records[("norepack",Q)]['decode_tok_s']
+              ktg = records[("kleidiai_only",Q)]['decode_tok_s']
+              pp_diff = abs(kpp-npp)/npp*100 if npp else 0
+              tg_diff = abs(ktg-ntg)/ntg*100 if ntg else 0
+              lines.append("")
+              lines.append("## G1 行为交叉验证(kleidiai_only vs norepack)")
+              lines.append(f"- prefill 差异: {pp_diff:.2f}%  | decode 差异: {tg_diff:.2f}%")
+              if Q == "q4_0":
+                  lines.append(f"- 预期:Q4_0 上 KleidiAI 真接管 → kleidiai_only 应**显著 ≠** norepack(差异 >5%)。实测 {'符合' if pp_diff>5 or tg_diff>5 else '不符/可疑 → 标 inconclusive'}。")
+              else:
+                  lines.append(f"- 预期:Q4_K_M 上 KleidiAI no-op → kleidiai_only 应**≈** norepack(差异 <3% 噪声内)。实测 {'符合' if pp_diff<3 and tg_diff<3 else '不符/可疑'}。")
+              lines.append("")
+              lines.append("## 探针采集说明(G1:不许循环论证)")
+              lines.append("- `verbose_log`:从 `llama-bench -v` 运行时日志拿到真证据(优先,唯一可单独支撑 active 断言)。")
+              lines.append("- `cmake_inferred`/`compiled_inferred`:运行时日志无证据时的**最后兜底**,绝不单独作为 active 依据。")
+              lines.append("- `inconclusive_*`:拿不到证据且行为含糊,不硬断言(本表对应格如实标 false + source=inconclusive)。")
+              lines.append("")
+              if Q == "q4_k_m":
+                  lines.append("## KleidiAI k-quant no-op gotcha")
+                  lines.append("- KleidiAI 微内核仅覆盖 Q4_0/Q8_0,对 Q4_K_M 完全 no-op(select_kernels 返回 nullptr)。")
+                  lines.append("- 本表 kleidiai_only/kleidiai 两档 kleidiai_active 应为 false、offloaded=0;speedup 应≈ norepack(噪声内)。")
+                  lines.append("")
+              if Q == "q4_0":
+                  lines.append("## G2 Q4_0 双优化叠加交互")
+                  lines.append("- kleidiai 档(repack+KleidiAI 都 ON)在 Q4_0 上两者可能竞争同一批张量。")
+                  lines.append("- 探针记录实际接管:见 kleidiai_active / repack_active / offloaded。")
+                  lines.append("- 若 kleidiai 档 offloaded=0 而 repack_active=true → repack 抢先接管 Q4_0→Q4_X_X,KleidiAI 被旁路,收益归 repack 不归 KleidiAI。")
+                  lines.append("")
+              pathlib.Path(f"results/{ts}-comparison-{Q}.md").write_text("\n".join(lines)+"\n", encoding='utf-8')
+              print(f"=== comparison table {Q} written ===")
+
+          print("=== ALL 10 RESULTS SUMMARY ===")
+          for (V,Q),r in records.items():
+              print(f"{V:16s} {Q:8s} pp={r['prefill_tok_s']:.3f} tg={r['decode_tok_s']:.3f} ttft={r['ttft_ms']:.1f} mem={r['peak_mem_mb']:.1f} k_comp={r['kleidiai_compiled']} k_act={r['kleidiai_active']} off={r['kleidiai_tensors_offloaded']} r_act={r['repack_active']}")
+          PYEOF
+
+      - name: Upload artifacts (full audit trail — 全程 AI 参赛佐证)
         if: always()
         uses: actions/upload-artifact@v4.4.3
         with:
-          name: naive-baseline-${{ github.run_id }}
+          name: t2-matrix-${{ github.run_id }}
           path: |
             results/*.json
-            bench_raw.json
-            time_stderr.txt
+            results/*-comparison-*.md
+            bench_logs/
+            third_party/llama.cpp/build-*/probe_build.txt
+            third_party/llama.cpp/build-*/cmake_config.log
           if-no-files-found: error
 
-      - name: Commit baseline JSON to repo (durable record, NF1)
+      - name: Commit results + comparison tables to repo (NF1 durable record)
         if: success()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add results/*.json
+          git add results/*.json results/*-comparison-*.md
           if git diff --cached --quiet; then
-            echo "no new result JSON to commit"
+            echo "no new result files to commit"
           else
-            git commit -m "T1 baseline: naive Q4_K_M results JSON (auto from CI run #${{ github.run_id }})"
+            git commit -m "T2 matrix: 5 variants × 2 quants same-machine bench (CI #${{ github.run_id }})"
             git pull --rebase origin "$GITHUB_REF_NAME" || true
             git push origin "HEAD:$GITHUB_REF_NAME"
-            echo "committed baseline JSON:"
+            echo "committed T2 matrix results:"
             git show --stat HEAD
           fi
