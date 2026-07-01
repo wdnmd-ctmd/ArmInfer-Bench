@@ -1,8 +1,11 @@
-name: Arm64 Bench (T2 five-variant matrix)
+name: Arm64 Bench (T3: 3-quant matrix + perplexity + PMU probe)
 
-# W2 = T2. Source of truth: .trae/specs/bootstrap-arm-infer-bench/spec.md
-# 五档 × 两量化 = 10 次基准,严格遵守 NF4 同机对照(同 job 同 runner 连续跑完)。
-# 总监 W2 护栏:G1 探针交叉验证(不许循环论证)/ G2 Q4_0 双优化交互注明 / G3 50min 红线。
+# W3 = T3. Source of truth: .trae/specs/bootstrap-arm-infer-bench/spec.md
+# 五档 × 三量化(Q4_K_M/Q4_0/Q8_0) = 15 速度基准 + perplexity 质量列 + PMU 探针。
+# 严格遵守 NF4 同机对照(同 job 同 runner 连续跑完)。
+# 护栏:G1 探针交叉验证 / G2 Q4_0 双优化交互 / G3 50min 红线 /
+#       G4 结果不丢(perplexity timeout + always() commit)/ G5 内存 tie-break /
+#       G6 降级顺序固定 / G7 perplexity 公平性断言。
 
 on:
   push:
@@ -31,9 +34,20 @@ env:
   # Q4_K_M (T1 baseline, known sha256).
   GGUF_FILE_Q4_K_M: qwen2.5-1.5b-instruct-q4_k_m.gguf
   GGUF_SHA256_Q4_K_M: 6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e
-  # Q4_0 (T2 new — sha256 verified on first CI download, recorded into JSON + $GITHUB_ENV).
+  # Q4_0 (T2 — sha256 verified on first CI download, recorded into JSON + $GITHUB_ENV).
   GGUF_FILE_Q4_0: qwen2.5-1.5b-instruct-q4_0.gguf
   GGUF_SHA256_Q4_0: ""
+  # Q8_0 (T3 new — KleidiAI coverage quant, headline. sha256 first-CI compute).
+  GGUF_FILE_Q8_0: qwen2.5-1.5b-instruct-q8_0.gguf
+  GGUF_SHA256_Q8_0: ""
+  # Wikitext-2 test set for perplexity (T3). URL pinned from llama.cpp get-wikitext-2.sh.
+  WIKITEXT_URL: https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
+  WIKITEXT_FILE: wikitext-2-raw/wiki.test.raw
+  WIKITEXT_SHA256: ""
+  # Perplexity params (T3). --chunks 8 × -c 512 = 4096 tokens (~7.5min total).
+  PPL_CHUNKS: 8
+  PPL_CTX: 512
+  PPL_BATCH: 512
   # Pinned bench args (NF3).
   BENCH_THREADS: 4
   BENCH_PP: 512
@@ -41,7 +55,7 @@ env:
   BENCH_REPS: 5
 
 jobs:
-  five-variant-matrix:
+  three-quant-matrix:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -82,10 +96,16 @@ jobs:
           echo "runner_os=${RUNNER_OS}" >> "$GITHUB_OUTPUT"
           { echo "=== compiler ==="; cc --version | head -1; echo "=== runner os ==="; cat /etc/os-release; } | sed 's/^/  /'
 
-      - name: Install ccache + binutils (nm probe needs binutils)
+      - name: Install ccache + binutils + unzip + perf (T3: unzip for wikitext, perf for PMU probe)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ccache binutils
+          sudo apt-get install -y -qq ccache binutils unzip
+          # perf for PMU probe (T3b). Try common package names; if install fails, PMU step
+          # uses continue-on-error so the matrix is not blocked.
+          sudo apt-get install -y -qq linux-tools-common 2>/dev/null || true
+          sudo apt-get install -y -qq linux-tools-generic 2>/dev/null || true
+          sudo apt-get install -y -qq linux-perf 2>/dev/null || true
+          echo "perf available: $(command -v perf || echo 'no')"
 
       - name: Configure ccache cache (shared across all 5 variants, G3)
         uses: actions/cache@v4.2.0
@@ -112,7 +132,21 @@ jobs:
           path: models/${{ env.GGUF_FILE_Q4_0 }}
           key: gguf-${{ env.GGUF_FILE_Q4_0 }}-${{ env.GGUF_REV }}
 
-      - name: Download GGUFs + sha256 verify
+      - name: Restore GGUF Q8_0 cache (T3 new)
+        id: gguf-q80-cache
+        uses: actions/cache@v4.2.0
+        with:
+          path: models/${{ env.GGUF_FILE_Q8_0 }}
+          key: gguf-${{ env.GGUF_FILE_Q8_0 }}-${{ env.GGUF_REV }}
+
+      - name: Restore wikitext-2 cache (T3 perplexity dataset)
+        id: wikitext-cache
+        uses: actions/cache@v4.2.0
+        with:
+          path: wikitext-2-raw/wiki.test.raw
+          key: wikitext-2-raw-v1-test-raw
+
+      - name: Download GGUFs + wikitext + sha256 verify
         run: |
           mkdir -p models
           # Q4_K_M (known sha256, strict verify).
@@ -134,7 +168,26 @@ jobs:
           Q40_SHA="$(sha256sum "models/${GGUF_FILE_Q4_0}" | awk '{print $1}')"
           echo "Q4_0 actual sha256: ${Q40_SHA}"
           echo "gguf_sha256_q4_0=${Q40_SHA}" >> "$GITHUB_ENV"
-          echo "GGUFs verified/present."
+          # Q8_0 (T3 new — sha256 unknown a priori — compute on first download, record to $GITHUB_ENV).
+          if [ ! -f "models/${GGUF_FILE_Q8_0}" ]; then
+            URL="https://huggingface.co/${GGUF_REPO}/resolve/${GGUF_REV}/${GGUF_FILE_Q8_0}"
+            echo "Downloading ${URL}"
+            curl -fL --retry 5 --retry-delay 3 --connect-timeout 30 -o "models/${GGUF_FILE_Q8_0}" "${URL}"
+          fi
+          Q80_SHA="$(sha256sum "models/${GGUF_FILE_Q8_0}" | awk '{print $1}')"
+          echo "Q8_0 actual sha256: ${Q80_SHA}"
+          echo "gguf_sha256_q8_0=${Q80_SHA}" >> "$GITHUB_ENV"
+          # Wikitext-2 test set for perplexity (sha256 first-CI compute).
+          if [ ! -f "${WIKITEXT_FILE}" ]; then
+            echo "Downloading wikitext-2 from ${WIKITEXT_URL}"
+            curl -fL --retry 5 --retry-delay 3 --connect-timeout 30 -o "wikitext-2-raw-v1.zip" "${WIKITEXT_URL}"
+            unzip -o "wikitext-2-raw-v1.zip"
+            rm -f "wikitext-2-raw-v1.zip"
+          fi
+          WIKI_SHA="$(sha256sum "${WIKITEXT_FILE}" | awk '{print $1}')"
+          echo "wikitext sha256: ${WIKI_SHA}"
+          echo "wikitext_sha256=${WIKI_SHA}" >> "$GITHUB_ENV"
+          echo "GGUFs + wikitext verified/present."
 
       - name: Build 5 variants (serial, same runner — NF4)
         run: |
@@ -143,12 +196,16 @@ jobs:
             bash scripts/build_variant.sh "$V" third_party/llama.cpp "third_party/llama.cpp/build-$V"
           done
 
-      - name: Run 10 benchmarks (5 variants × 2 quants, -v for runtime probes — G1)
+      - name: Run 15 benchmarks (5 variants × 3 quants, -v for runtime probes — G1)
         run: |
           mkdir -p bench_logs
           for V in naive norepack repack kleidiai_only kleidiai; do
-            for Q in q4_k_m q4_0; do
-              if [ "$Q" = "q4_k_m" ]; then MODEL="models/${GGUF_FILE_Q4_K_M}"; else MODEL="models/${GGUF_FILE_Q4_0}"; fi
+            for Q in q4_k_m q4_0 q8_0; do
+              case "$Q" in
+                q4_k_m) MODEL="models/${GGUF_FILE_Q4_K_M}" ;;
+                q4_0)   MODEL="models/${GGUF_FILE_Q4_0}" ;;
+                q8_0)   MODEL="models/${GGUF_FILE_Q8_0}" ;;
+              esac
               BENCH_BIN="third_party/llama.cpp/build-$V/bin/llama-bench"
               TAG="${V}__${Q}"
               echo "::group::bench $TAG"
@@ -174,7 +231,76 @@ jobs:
             done
           done
 
-      - name: Assemble 10 result JSONs + 2 comparison tables (probes G1 cross-validated)
+      - name: Run perplexity (naive × 3 quants + kleidiai-Q4_0 spot-check, --chunks 8 — G3/G4)
+        # G4: step-level timeout so perplexity cannot drag the whole 60min job and lose the 15
+        # speed JSONs. If this step times out, assembly+commit still run via if: always().
+        # G6: if approaching budget,降级顺序 = 先砍 kleidiai-Q4_0 spot-check,再统一降 chunks(8→4).
+        #     绝不让三量化用不同 chunks 对比(G7 公平性). 先报再动.
+        timeout-minutes: 12
+        run: |
+          mkdir -p ppl_logs
+          # Perplexity set: naive × 3 quants (PPL reference) + kleidiai-Q4_0 (spot-check).
+          # --chunks 8 -c 512 = 4096 tokens. NO --ppl-stride (would skip Final estimate line).
+          PPL_SET="naive__q4_k_m naive__q4_0 naive__q8_0 kleidiai__q4_0"
+          for TAG in $PPL_SET; do
+            V="${TAG%%__*}"; Q="${TAG##*__}"
+            case "$Q" in
+              q4_k_m) MODEL="models/${GGUF_FILE_Q4_K_M}" ;;
+              q4_0)   MODEL="models/${GGUF_FILE_Q4_0}" ;;
+              q8_0)   MODEL="models/${GGUF_FILE_Q8_0}" ;;
+            esac
+            PPL_BIN="third_party/llama.cpp/build-$V/bin/llama-perplexity"
+            echo "::group::perplexity $TAG"
+            set +e
+            /usr/bin/time -v "$PPL_BIN" \
+              -m "$MODEL" -f "${WIKITEXT_FILE}" \
+              -c "${PPL_CTX}" -b "${PPL_BATCH}" -t "${BENCH_THREADS}" \
+              --chunks "${PPL_CHUNKS}" \
+              > "ppl_logs/ppl_${TAG}.log" 2>&1
+            RC=$?
+            set -e
+            if [ $RC -ne 0 ]; then
+              echo "::error::llama-perplexity $TAG exited $RC"
+              cat "ppl_logs/ppl_${TAG}.log"
+              exit $RC
+            fi
+            echo "=== ppl_${TAG}.log tail ==="; tail -20 "ppl_logs/ppl_${TAG}.log"
+            echo "::endgroup::"
+          done
+
+      - name: PMU availability probe (T3b Performix feasibility — non-blocking)
+        # 总监裁定: CI 内加 PMU 探针. 检查 GHA Arm64 runner 是否透传 PMU/SPE.
+        # 结论留 T5 Performix 决策. continue-on-error 确保不阻塞矩阵.
+        id: pmu
+        continue-on-error: true
+        run: |
+          echo "::group::PMU availability probe"
+          {
+            echo "=== /proc/bus/event_source/devices ==="
+            ls /proc/bus/event_source/devices/ 2>/dev/null || echo "(none)"
+            echo "=== /sys/bus/event_source/devices ==="
+            ls /sys/bus/event_source/devices/ 2>/dev/null || echo "(none)"
+            echo "=== arm_spe (Statistical Profiling Extension) ==="
+            ls /sys/bus/event_source/devices/arm_spe* 2>/dev/null || echo "(no arm_spe)"
+            echo "=== perf stat test (cycles + instructions) ==="
+            perf stat -e cycles,instructions ls / >/dev/null 2>&1 && echo "perf_stat: OK" || echo "perf_stat: FAILED"
+            echo "=== perf list hardware ==="
+            perf list hw 2>/dev/null | head -20 || echo "(perf not available)"
+          } | tee pmu_probe.log
+          # Conclusion: if perf stat OK + arm_spe present -> PMU passthrough likely.
+          if perf stat -e cycles,instructions ls / >/dev/null 2>&1; then
+            echo "pmu_available=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::PMU appears available — Performix may work (defer to T5)"
+          else
+            echo "pmu_available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::PMU NOT available — Performix won't work on GHA Arm64 VM; use perf stat fallback"
+          fi
+          echo "::endgroup::"
+
+      - name: Assemble 15 result JSONs + 4 perplexity JSONs + 3 comparison tables + decision table
+        # G4: if: always() so 15 speed JSONs are assembled+committed even if perplexity/PMU
+        # step timed out or failed. Speed JSONs are the lifeline of this round.
+        if: always()
         run: |
           python3 - <<'PYEOF'
           import json, os, re, subprocess, datetime, pathlib, sys
@@ -205,24 +331,30 @@ jobs:
           ttft_formula = "ttft_ms = pp_n / prefill_tok_s * 1000"
 
           variants = ["naive","norepack","repack","kleidiai_only","kleidiai"]
-          quants   = ["q4_k_m","q4_0"]
+          quants   = ["q4_k_m","q4_0","q8_0"]
           gguf_file = {"q4_k_m": os.environ['GGUF_FILE_Q4_K_M'],
-                       "q4_0":   os.environ['GGUF_FILE_Q4_0']}
+                       "q4_0":   os.environ['GGUF_FILE_Q4_0'],
+                       "q8_0":   os.environ['GGUF_FILE_Q8_0']}
           gguf_sha  = {"q4_k_m": os.environ['GGUF_SHA256_Q4_K_M'],
-                       "q4_0":   os.environ.get('gguf_sha256_q4_0','')}
+                       "q4_0":   os.environ.get('gguf_sha256_q4_0',''),
+                       "q8_0":   os.environ.get('gguf_sha256_q8_0','')}
 
           ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
           pathlib.Path('results').mkdir(exist_ok=True)
           records = {}
 
+          # ===== Phase 1: Assemble 15 speed JSONs (CORE — must not fail) =====
           for V in variants:
               for Q in quants:
                   tag = f"{V}__{Q}"
-                  raw = pathlib.Path(f"bench_logs/bench_{tag}.json").read_text().strip()
+                  raw_path = pathlib.Path(f"bench_logs/bench_{tag}.json")
+                  if not raw_path.exists():
+                      print(f"::error::bench log missing for {tag} — speed JSON is the lifeline, cannot proceed")
+                      sys.exit(1)
+                  raw = raw_path.read_text().strip()
                   if not raw:
                       print(f"::error::empty llama-bench output for {tag}"); sys.exit(1)
                   rows = json.loads(raw)
-                  # b9728 llama-bench JSON: each row ONE test (pp OR tg), throughput in avg_ts/stddev_ts.
                   prefill_avg = prefill_sd = decode_avg = decode_sd = None
                   for r in rows:
                       avg_ts = r.get('avg_ts'); stddev_ts = r.get('stddev_ts')
@@ -235,7 +367,6 @@ jobs:
                   if prefill_avg is None or decode_avg is None:
                       print(f"::error::could not parse avg_ts for {tag}"); print(rows); sys.exit(1)
 
-                  # Peak mem from time -v (line lives at end of combined stderr).
                   stderr_txt = pathlib.Path(f"bench_logs/all_{tag}.stderr").read_text(errors='replace')
                   m = re.search(r'Maximum resident set size \(kbytes\)\s*:\s*(\d+)', stderr_txt)
                   if not m:
@@ -256,21 +387,9 @@ jobs:
                   repack_cmake = probe_val('repack_cmake_state')
                   kleidiai_cmake = probe_val('kleidiai_cmake_state')
 
-                  # Runtime probes from verbose stderr (G1: prefer real runtime evidence).
                   repack_msgs = re.findall(r'repack tensor', stderr_txt, re.I)
                   kleidiai_lines = [l for l in stderr_txt.splitlines() if re.search(r'kleidiai', l, re.I)]
 
-                  # kleidiai_active (G1 fix — no circular reasoning, no hard assertion on noise):
-                  # Source inspection of kleidiai.cpp @ fabde3b shows:
-                  #   - init prints "kleidiai: primary q4/q8 kernel feature ..." (line 273/279) based
-                  #     on CPU features ONLY — printed for ALL quants when KleidiAI is compiled,
-                  #     NOT a per-model takeover signal (this was the Q4_K_M false-positive root cause).
-                  #   - kleidiai_get_block_args (line 343-352) returns {0,0,0} for non-Q4_0/Q8_0 ->
-                  #     op dispatch fn is never called for Q4_K_M -> no runtime takeover.
-                  #   - op dispatch succeeds silently (only line 859 WARNs on runtime_count==0 failure).
-                  # => "primary kernel" log alone is NOT takeover proof (init noise on Q4_K_M too).
-                  # Real takeover = compiled AND quant in KleidiAI coverage (Q4_0/Q8_0) AND primary
-                  # kernel selected. Behavior cross-validated by the consistency assert below.
                   kleidiai_primary_kernel = any(re.search(r'kleidiai:\s*primary\s+(q4|q8)\s+kernel', l, re.I) for l in kleidiai_lines)
                   kleidiai_no_compatible  = any(re.search(r'kleidiai:\s*no compatible\s+(q4|q8)\s+kernels', l, re.I) for l in kleidiai_lines)
                   kleidiai_supported_quant = Q in ("q4_0", "q8_0")
@@ -278,18 +397,14 @@ jobs:
                   if not kleidiai_compiled:
                       kleidiai_active = False; kleidiai_active_source = "no_kleidiai_in_build"
                   elif not kleidiai_supported_quant:
-                      # Q4_K_M etc: kleidiai_get_block_args returns {0,0,0}, op never called -> no-op
-                      # (source-code coverage fact, NOT behavior-inferred — satisfies G1).
                       kleidiai_active = False; kleidiai_active_source = "no_runtime_takeover_kquant_noop"
                   elif kleidiai_no_compatible:
                       kleidiai_active = False; kleidiai_active_source = "no_compatible_kernel_for_cpu"
                   elif kleidiai_primary_kernel:
-                      # Q4_0/Q8_0 + select succeeded -> candidate active; behavior cross-checked below.
                       kleidiai_active = True; kleidiai_active_source = "verbose_log_primary_kernel"
                   else:
                       kleidiai_active = False; kleidiai_active_source = "inconclusive_no_primary_kernel_log"
 
-                  # repack_active: runtime log wins; cmake_inferred ONLY last-resort fallback (G1).
                   if repack_msgs:
                       repack_active = True; repack_active_source = "verbose_log"
                   elif repack_cmake == "ON":
@@ -297,10 +412,6 @@ jobs:
                   else:
                       repack_active = False; repack_active_source = "cmake_off"
 
-                  # offloaded (G1 fix): b9728 KleidiAI op dispatch succeeds silently — no per-tensor
-                  # count in the log (kleidiai.cpp only WARNs at line 859 on failure; slot_count/count
-                  # are kernel-slot counts, not offloaded-tensor counts). No reliable count can be
-                  # parsed -> honest null + source, never fake -1 (which reads like an error).
                   offloaded = None
                   offloaded_source = "unavailable_in_build_log"
 
@@ -322,14 +433,11 @@ jobs:
                       "n_threads": n_threads, "cpu_model": cpu_model, "cpu_features": feats,
                       "compiler": compiler, "llama_commit": llama_commit, "runner_os": runner_os,
                       "timestamp": ts,
-                      # T2 activation probes (4 fields, G1 cross-validated).
                       "kleidiai_compiled": kleidiai_compiled,
                       "kleidiai_active": kleidiai_active,
                       "kleidiai_tensors_offloaded": offloaded,
                       "kleidiai_tensors_offloaded_source": offloaded_source,
                       "repack_active": repack_active,
-                      # Probe sources (G1: verbose_log=real runtime evidence; *_inferred=last-resort
-                      # fallback NEVER alone sufficient for active; inconclusive_* = no hard assertion).
                       "kleidiai_active_source": kleidiai_active_source,
                       "repack_active_source": repack_active_source,
                       "kleidiai_compiled_nm_count": nm_count,
@@ -342,10 +450,7 @@ jobs:
                   print(f"=== {tag} ===")
                   print(json.dumps({k:result[k] for k in ('variant','quant','prefill_tok_s','decode_tok_s','ttft_ms','peak_mem_mb','kleidiai_compiled','kleidiai_active','kleidiai_tensors_offloaded','kleidiai_tensors_offloaded_source','repack_active','kleidiai_active_source','repack_active_source')}, ensure_ascii=False, indent=2))
 
-          # ===== G1 consistency assertion: probe MUST agree with behavior (no circular reasoning) =====
-          # active=True but kleidiai_only speedup ≈ 1 (within noise) -> probe contradicts no-op
-          # behavior -> FAIL the build. Conversely active=False on Q4_0 but speedup >> 1 -> probe
-          # missed a real takeover -> FAIL. This keeps probe and behavior permanently in sync.
+          # ===== G1 consistency assertion: probe MUST agree with behavior =====
           for Q in quants:
               k = records.get(("kleidiai_only", Q)); n = records.get(("norepack", Q))
               if not (k and n and n['prefill_tok_s'] > 0):
@@ -353,19 +458,82 @@ jobs:
               pp_ratio = k['prefill_tok_s'] / n['prefill_tok_s']
               tg_ratio = k['decode_tok_s']  / n['decode_tok_s']
               if k['kleidiai_active']:
-                  # active=True expects real takeover -> speedup significantly > 1 (>5%).
                   if abs(pp_ratio - 1.0) < 0.05 and abs(tg_ratio - 1.0) < 0.05:
-                      print(f"::error::G1 CONSISTENCY FAIL: kleidiai_only-{Q} kleidiai_active=True but speedup~=1 (pp={pp_ratio:.3f}, tg={tg_ratio:.3f}) -- probe contradicts no-op behavior")
+                      print(f"::error::G1 CONSISTENCY FAIL: kleidiai_only-{Q} kleidiai_active=True but speedup~=1 (pp={pp_ratio:.3f}, tg={tg_ratio:.3f})")
                       sys.exit(1)
               else:
-                  # active=False on a KleidiAI-covered quant (Q4_0/Q8_0) expects no-op (speedup~=1);
-                  # if speedup >> 1 there -> probe missed a real takeover -> FAIL.
                   if Q in ("q4_0", "q8_0") and (pp_ratio > 1.10 or tg_ratio > 1.10):
-                      print(f"::error::G1 CONSISTENCY FAIL: kleidiai_only-{Q} kleidiai_active=False but speedup>>1 (pp={pp_ratio:.3f}, tg={tg_ratio:.3f}) -- behavior shows real takeover probe missed")
+                      print(f"::error::G1 CONSISTENCY FAIL: kleidiai_only-{Q} kleidiai_active=False but speedup>>1 (pp={pp_ratio:.3f}, tg={tg_ratio:.3f})")
                       sys.exit(1)
-          print("=== G1 consistency check PASSED: probe agrees with behavior on all quants ===")
+          print("=== G1 consistency check PASSED: probe agrees with behavior on all 3 quants ===")
 
-          # ===== Generate 2 comparison tables (one per quant) + G1 behavior cross-check =====
+          # ===== Phase 2: Parse perplexity logs (G4: tolerate missing if step timed out) =====
+          ppl_records = {}
+          ppl_set = [("naive","q4_k_m"), ("naive","q4_0"), ("naive","q8_0"), ("kleidiai","q4_0")]
+          ppl_chunks = int(os.environ.get('PPL_CHUNKS','8'))
+          ppl_ctx = int(os.environ.get('PPL_CTX','512'))
+          wiki_sha = os.environ.get('wikitext_sha256','')
+          for V, Q in ppl_set:
+              tag = f"{V}__{Q}"
+              log_path = pathlib.Path(f"ppl_logs/ppl_{tag}.log")
+              if not log_path.exists():
+                  print(f"::warning::perplexity log missing for {tag} (step may have timed out) — decision table PPL = N/A for this entry")
+                  continue
+              log = log_path.read_text(errors='replace')
+              m = re.search(r'Final estimate: PPL = ([\d.]+) \+/- ([\d.]+)', log)
+              if not m:
+                  print(f"::warning::could not parse PPL for {tag} — decision table PPL = N/A for this entry")
+                  continue
+              ppl = float(m.group(1)); ppl_sd = float(m.group(2))
+              ppl_records[(V,Q)] = {
+                  "perplexity": ppl, "perplexity_stddev": ppl_sd,
+                  "n_chunks": ppl_chunks, "n_ctx": ppl_ctx,
+                  "wikitext_sha256": wiki_sha,
+              }
+              # Write perplexity JSON
+              ppl_json = {
+                  "variant": V, "quant": Q.upper(),
+                  "model": "Qwen2.5-1.5B-Instruct", "model_revision": os.environ['GGUF_REV'],
+                  "model_sha256": gguf_sha[Q],
+                  "model_size_mb": round(pathlib.Path('models', gguf_file[Q]).stat().st_size/(1024*1024), 2),
+                  "perplexity": ppl, "perplexity_stddev": ppl_sd,
+                  "perplexity_formula": "Final estimate: PPL = X +/- Y (wikitext-2 test, --chunks 8 -c 512)",
+                  "n_chunks": ppl_chunks, "n_ctx": ppl_ctx,
+                  "chunks_tokens": ppl_chunks * ppl_ctx,
+                  "wikitext_sha256": wiki_sha,
+                  "llama_commit": llama_commit, "timestamp": ts,
+              }
+              pathlib.Path(f'results/{ts}-perplexity-{V}-{Q}.json').write_text(
+                  json.dumps(ppl_json, ensure_ascii=False, indent=2)+"\n", encoding='utf-8')
+              print(f"=== perplexity {tag}: PPL={ppl:.4f} +/- {ppl_sd:.5f} ===")
+
+          # ===== G7 fairness assertion: all 4 perplexity runs MUST use same params =====
+          if len(ppl_records) == len(ppl_set):
+              ppl_params = set()
+              for (V,Q) in ppl_set:
+                  r = ppl_records[(V,Q)]
+                  ppl_params.add((r['n_chunks'], r['n_ctx'], r['wikitext_sha256']))
+              if len(ppl_params) > 1:
+                  print(f"::error::G7 FAIRNESS FAIL: perplexity params differ across runs: {ppl_params}")
+                  sys.exit(1)
+              print("=== G7 fairness check PASSED: all 4 perplexity runs use same n_chunks/n_ctx/wikitext_sha256 ===")
+          else:
+              print(f"::warning::G7 skipped — only {len(ppl_records)}/{len(ppl_set)} perplexity runs present (step may have timed out)")
+
+          # ===== PPL spot-check: kleidiai-Q4_0 vs naive-Q4_0 (容差 <2%, G1 numerical equivalence) =====
+          spot_check_ok = None; ppl_diff_pct = None
+          if ("naive","q4_0") in ppl_records and ("kleidiai","q4_0") in ppl_records:
+              n_ppl = ppl_records[("naive","q4_0")]["perplexity"]
+              k_ppl = ppl_records[("kleidiai","q4_0")]["perplexity"]
+              ppl_diff_pct = abs(k_ppl - n_ppl) / n_ppl * 100
+              spot_check_ok = ppl_diff_pct < 2.0
+              print(f"=== PPL spot-check: kleidiai-Q4_0 ({k_ppl:.4f}) vs naive-Q4_0 ({n_ppl:.4f}), diff={ppl_diff_pct:.3f}% ===")
+              if not spot_check_ok:
+                  print(f"::warning::PPL spot-check diff {ppl_diff_pct:.3f}% > 2% tolerance — KleidiAI may alter numerics")
+          else:
+              print("::warning::PPL spot-check skipped — one or both perplexity runs missing")
+
+          # ===== Phase 3: Generate 3 comparison tables (one per quant) =====
           def speedup(a, b): return round(a/b, 3) if b else None
           for Q in quants:
               naive = records[("naive", Q)]
@@ -395,8 +563,8 @@ jobs:
               lines.append("")
               lines.append("## G1 行为交叉验证(kleidiai_only vs norepack)")
               lines.append(f"- prefill 差异: {pp_diff:.2f}%  | decode 差异: {tg_diff:.2f}%")
-              if Q == "q4_0":
-                  lines.append(f"- 预期:Q4_0 上 KleidiAI 真接管 → kleidiai_only 应**显著 ≠** norepack(差异 >5%)。实测 {'符合' if pp_diff>5 or tg_diff>5 else '不符/可疑 → 标 inconclusive'}。")
+              if Q in ("q4_0", "q8_0"):
+                  lines.append(f"- 预期:{Q.upper()} 上 KleidiAI 真接管 → kleidiai_only 应**显著 ≠** norepack(差异 >5%)。实测 {'符合' if pp_diff>5 or tg_diff>5 else '不符/可疑 → 标 inconclusive'}。")
               else:
                   lines.append(f"- 预期:Q4_K_M 上 KleidiAI no-op → kleidiai_only 应**≈** norepack(差异 <3% 噪声内)。实测 {'符合' if pp_diff<3 and tg_diff<3 else '不符/可疑'}。")
               lines.append("")
@@ -408,7 +576,7 @@ jobs:
               if Q == "q4_k_m":
                   lines.append("## KleidiAI k-quant no-op gotcha")
                   lines.append("- KleidiAI 微内核仅覆盖 Q4_0/Q8_0,对 Q4_K_M 完全 no-op(kleidiai_get_block_args 返回 {0,0,0},op 不被调用)。")
-                  lines.append("- 本表 kleidiai_only/kleidiai 两档 kleidiai_active 应为 false(source=no_runtime_takeover_kquant_noop)、offloaded=null(b9728 op 静默无张量计数日志);speedup 应≈ norepack(噪声内)。G1 一致性断言已交叉验证 active 与行为一致。")
+                  lines.append("- 本表 kleidiai_only/kleidiai 两档 kleidiai_active 应为 false(source=no_runtime_takeover_kquant_noop)、offloaded=null;speedup 应≈ norepack(噪声内)。G1 一致性断言已交叉验证 active 与行为一致。")
                   lines.append("")
               if Q == "q4_0":
                   lines.append("## G2 Q4_0 双优化叠加交互")
@@ -416,42 +584,138 @@ jobs:
                   lines.append("- b9728 KleidiAI op 静默无张量计数日志 -> offloaded=null(source=unavailable_in_build_log),无法用 offloaded 判定接管者。")
                   lines.append("- 行为判定:kleidiai 档 speedup ~= kleidiai_only ~= repack(三者持平)-> 无叠加收益,实际只一个路径接管,不可把 repack 收益重复记到 KleidiAI 头上。")
                   lines.append("")
+              if Q == "q8_0":
+                  lines.append("## Q8_0 KleidiAI vs repack(headline)")
+                  k8 = records[("kleidiai_only","q8_0")]; r8 = records[("repack","q8_0")]
+                  lines.append(f"- kleidiai_only decode {k8['decode_tok_s']:.3f} vs repack {r8['decode_tok_s']:.3f}")
+                  if k8['decode_tok_s'] > r8['decode_tok_s'] * 1.05:
+                      lines.append(f"- KleidiAI **>** repack(KleidiAI 胜 {(k8['decode_tok_s']/r8['decode_tok_s']-1)*100:.1f}%)")
+                  elif r8['decode_tok_s'] > k8['decode_tok_s'] * 1.05:
+                      lines.append(f"- repack **>** KleidiAI(repack 胜 {(r8['decode_tok_s']/k8['decode_tok_s']-1)*100:.1f}%)")
+                  else:
+                      lines.append(f"- KleidiAI **≈** repack(打平,差异 <5%)")
+                  lines.append(f"- kleidiai_active(Q8_0) = {k8['kleidiai_active']}(source={k8['kleidiai_active_source']})")
+                  lines.append("- Q8_0 是 KleidiAI 传说中收益最大的档;Q4_0 上 KleidiAI≈repack(打平),Q8_0 上的对比是本轮 headline。")
+                  lines.append("")
               pathlib.Path(f"results/{ts}-comparison-{Q}.md").write_text("\n".join(lines)+"\n", encoding='utf-8')
               print(f"=== comparison table {Q} written ===")
 
-          print("=== ALL 10 RESULTS SUMMARY ===")
+          # ===== Phase 4: Decision table ("选哪个量化") =====
+          # G5: best variant by decode tok/s, with memory tie-break if decode within 3% noise.
+          #   若两档 decode 差在噪声内(<3%),取峰值内存更低者(诚实体现内存换速度取舍).
+          dlines = []
+          dlines.append(f"# 选哪个量化:决策表(Qwen2.5-1.5B-Instruct, wikitext-2 PPL, --chunks {ppl_chunks} -c {ppl_ctx})")
+          dlines.append("")
+          dlines.append(f"runner cpu: {cpu_model} | llama_commit: {llama_commit} | timestamp: {ts}")
+          dlines.append("")
+          dlines.append("| quant | 体积MB | 最佳档 | prefill tok/s | decode tok/s | perplexity | 峰值内存MB(最佳档) | 最优优化路径 | PPL spot-check |")
+          dlines.append("|-------|--------|--------|---------------|--------------|------------|---------------------|-------------|----------------|")
+          for Q in quants:
+              # G5: find best variant by decode, with memory tie-break within 3% noise.
+              best_decode = max(records[(v,Q)]['decode_tok_s'] for v in variants)
+              within_noise = [v for v in variants if abs(records[(v,Q)]['decode_tok_s'] - best_decode) / best_decode < 0.03]
+              if len(within_noise) > 1:
+                  best_v = min(within_noise, key=lambda v: records[(v,Q)]['peak_mem_mb'])
+                  tie_note = f" (G5 tie-break: {len(within_noise)} 档 decode 差<3%, 取内存最低)"
+              else:
+                  best_v = within_noise[0]
+                  tie_note = ""
+              r = records[(best_v, Q)]
+              # Determine optimal path: repack or KleidiAI
+              repack_gain = records[("repack",Q)]['decode_tok_s'] / records[("norepack",Q)]['decode_tok_s']
+              kai_gain = records[("kleidiai_only",Q)]['decode_tok_s'] / records[("norepack",Q)]['decode_tok_s']
+              if Q == "q4_k_m":
+                  best_path = f"repack ({repack_gain:.2f}×) — KleidiAI no-op on k-quant"
+              elif kai_gain > repack_gain * 1.02:
+                  best_path = f"KleidiAI ({kai_gain:.2f}×) > repack ({repack_gain:.2f}×)"
+              elif repack_gain > kai_gain * 1.02:
+                  best_path = f"repack ({repack_gain:.2f}×) > KleidiAI ({kai_gain:.2f}×)"
+              else:
+                  best_path = f"repack ≈ KleidiAI (≈{repack_gain:.2f}×,打平)"
+              # PPL column
+              if ("naive",Q) in ppl_records:
+                  pr = ppl_records[("naive",Q)]
+                  ppl_str = f"{pr['perplexity']:.4f} ± {pr['perplexity_stddev']:.5f}"
+              else:
+                  ppl_str = "N/A (timed out)"
+              # Spot-check column
+              if Q == "q4_0":
+                  if spot_check_ok is True:
+                      spot = f"PASS (diff {ppl_diff_pct:.3f}%)"
+                  elif spot_check_ok is False:
+                      spot = f"FAIL (diff {ppl_diff_pct:.3f}%)"
+                  else:
+                      spot = "N/A (missing)"
+              else:
+                  spot = "—"
+              dlines.append(f"| {Q.upper()} | {r['model_size_mb']} | {best_v}{tie_note} | {r['prefill_tok_s']:.3f} | {r['decode_tok_s']:.3f} | {ppl_str} | {r['peak_mem_mb']:.1f} | {best_path} | {spot} |")
+          dlines.append("")
+          # Q8_0 headline insight
+          if ("kleidiai_only","q8_0") in records and ("repack","q8_0") in records:
+              k8 = records[("kleidiai_only","q8_0")]; r8 = records[("repack","q8_0")]
+              dlines.append("## Q8_0 KleidiAI vs repack(headline)")
+              if k8['decode_tok_s'] > r8['decode_tok_s'] * 1.05:
+                  dlines.append(f"- KleidiAI **>** repack:kleidiai_only decode {k8['decode_tok_s']:.3f} vs repack {r8['decode_tok_s']:.3f}(KleidiAI 胜 {(k8['decode_tok_s']/r8['decode_tok_s']-1)*100:.1f}%)")
+              elif r8['decode_tok_s'] > k8['decode_tok_s'] * 1.05:
+                  dlines.append(f"- repack **>** KleidiAI:repack decode {r8['decode_tok_s']:.3f} vs kleidiai_only {k8['decode_tok_s']:.3f}(repack 胜 {(r8['decode_tok_s']/k8['decode_tok_s']-1)*100:.1f}%)")
+              else:
+                  dlines.append(f"- KleidiAI **≈** repack:kleidiai_only {k8['decode_tok_s']:.3f} vs repack {r8['decode_tok_s']:.3f}(打平,差异 <5%)")
+              dlines.append(f"- kleidiai_active(Q8_0) = {k8['kleidiai_active']}(source={k8['kleidiai_active_source']})")
+              dlines.append("- 对比 Q4_0(KleidiAI≈repack 打平):Q8_0 上 KleidiAI 是否能胜出是本轮 headline。")
+              dlines.append("")
+          dlines.append("## G5 内存 tie-break 说明")
+          dlines.append("- 决策表选每量化'最佳档'时,若两档 decode 差在噪声内(<3%),取峰值内存更低者。")
+          dlines.append("- 诚实体现'内存换速度'取舍(如 repack ~1.7× 峰值内存换速度)。")
+          dlines.append("")
+          dlines.append("## G7 公平性断言")
+          if len(ppl_records) == len(ppl_set):
+              dlines.append(f"- 4 份 perplexity JSON 的 n_chunks={ppl_chunks} / n_ctx={ppl_ctx} / wikitext_sha256 一致 ✓")
+          else:
+              dlines.append(f"- ⚠️ 仅 {len(ppl_records)}/{len(ppl_set)} 份 perplexity 完成,G7 断言跳过(可能 perplexity step 超时)")
+          dlines.append("")
+          pathlib.Path(f'results/{ts}-decision-table.md').write_text("\n".join(dlines)+"\n", encoding='utf-8')
+          print(f"=== decision table written ===")
+
+          print("=== ALL 15 RESULTS SUMMARY ===")
           for (V,Q),r in records.items():
               print(f"{V:16s} {Q:8s} pp={r['prefill_tok_s']:.3f} tg={r['decode_tok_s']:.3f} ttft={r['ttft_ms']:.1f} mem={r['peak_mem_mb']:.1f} k_comp={r['kleidiai_compiled']} k_act={r['kleidiai_active']} k_src={r['kleidiai_active_source']} off={r['kleidiai_tensors_offloaded']} r_act={r['repack_active']}")
+          print("=== PERPLEXITY SUMMARY ===")
+          for (V,Q),r in ppl_records.items():
+              print(f"{V:16s} {Q:8s} PPL={r['perplexity']:.4f} +/- {r['perplexity_stddev']:.5f}")
           PYEOF
 
       - name: Upload artifacts (full audit trail — 全程 AI 参赛佐证)
         if: always()
         uses: actions/upload-artifact@v4.4.3
         with:
-          name: t2-matrix-${{ github.run_id }}
+          name: t3-matrix-${{ github.run_id }}
           path: |
             results/*.json
             results/*-comparison-*.md
+            results/*-decision-*.md
             bench_logs/
+            ppl_logs/
+            pmu_probe.log
             third_party/llama.cpp/build-*/probe_build.txt
             third_party/llama.cpp/build-*/cmake_config.log
-          if-no-files-found: error
+          if-no-files-found: warn
 
-      - name: Commit results + comparison tables to repo (NF1 durable record)
-        if: success()
+      - name: Commit results + comparison tables + decision table to repo (NF1 durable record)
+        # G4: if: always() so 15 speed JSONs are committed even if perplexity/PMU step failed.
+        if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Purge previous-round T2 matrix files, keep T1 baseline (20260630T162334Z-*) + .gitkeep.
+          # Purge previous-round matrix files, keep T1 baseline (20260630T162334Z-*) + .gitkeep.
           # Eliminates stale probe JSON so downstream T4 dashboard never reads superseded data.
-          git ls-files 'results/*-q4_*.json' 'results/*-comparison-*.md' | grep -v '^results/20260630T162334Z-' | xargs -r git rm -f --ignore-unmatch
-          git add results/*.json results/*-comparison-*.md
+          git ls-files 'results/*-q4_*.json' 'results/*-q8_*.json' 'results/*-comparison-*.md' 'results/*-perplexity-*.json' 'results/*-decision-*.md' | grep -v '^results/20260630T162334Z-' | xargs -r git rm -f --ignore-unmatch
+          git add results/*.json results/*-comparison-*.md results/*-decision-*.md 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "no new result files to commit"
           else
-            git commit -m "T2 matrix: 5 variants × 2 quants same-machine bench (CI #${{ github.run_id }})"
+            git commit -m "T3 matrix: 5 variants × 3 quants + perplexity + PMU probe (CI #${{ github.run_id }})"
             git pull --rebase origin "$GITHUB_REF_NAME" || true
             git push origin "HEAD:$GITHUB_REF_NAME"
-            echo "committed T2 matrix results:"
+            echo "committed T3 matrix results:"
             git show --stat HEAD
           fi

@@ -10,7 +10,7 @@
 
 ## 本轮范围
 
-**W1 = T0 + T1**(已完成,naive baseline 锚点已立)。**W2 = T2**(进行中:五档 × 两量化同机对照)。事实来源:`.trae/specs/bootstrap-arm-infer-bench/spec.md`。T3–T6 为后续阶段。
+**W1 = T0 + T1**(已完成,naive baseline 锚点已立)。**W2 = T2**(已完成:五档 × 两量化同机对照,探针干净 + G1 一致性断言)。**W3 = T3**(进行中:三量化 × 五档 + perplexity 质量列 + Performix PMU 探针)。事实来源:`.trae/specs/bootstrap-arm-infer-bench/spec.md`。T4–T6 为后续阶段。
 
 ## 目录结构
 
@@ -104,6 +104,13 @@ repack 覆盖 Q4_0(→Q4_X_X)和 Q4_K(Q4_K_M 真生效,ARM i8mm 走 `q4_K_8x8_q8
 
 **CI 时长红线(G3)**:timeout 60min,逼近 50min 先停报告。严禁为省时拆到不同 job/runner(破坏 NF4)。
 
+**T3 新增护栏(G4–G7)**:
+
+- **G4 结果不可丢(最重要)**:15 档核心速度基准是命根,绝不能被可选步拖累而全丢。perplexity 步加 step 级 `timeout-minutes: 12`;PMU 步 `continue-on-error: true`。assembly + commit 步必须用 `if: always()`,确保即使 perplexity/PMU 失败或超时,已跑完的 15 份速度 JSON 仍能装配并 commit 回 main。单 job 60min 硬 timeout——step 级 timeout + always() commit 防 perplexity 卡住把整 job 拖到 60min 丢失 bench 成果。
+- **G5 内存 tie-break**:决策表选每量化"最佳档"时,若两档 decode 差在噪声内(<3%),取峰值内存更低者。诚实体现"内存换速度"取舍(如 repack ~1.7× 峰值内存换速度)。
+- **G6 G3 降级顺序固定**:逼近预算时先砍 kleidiai-Q4_0 spot-check,再按量化"统一"降 chunks(8→4)。绝不让三量化用不同 chunks 对比。先报再动。
+- **G7 公平性断言**:出决策表前 assert 4 份 perplexity JSON 的 `n_chunks` / `n_ctx` / `wikitext_sha256` 完全一致;不一致即 CI fail 或标红。防止意外混档对比污染质量结论。
+
 ## naive 诚实标注
 
 `naive` 为 **armv8-a 基础基线**,构建参数为 `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a -DGGML_CPU_KLEIDIAI=OFF -DGGML_CPU_REPACK=OFF`。
@@ -173,10 +180,30 @@ kleidiai_compiled_nm_count, repack_cmake_state, kleidiai_cmake_state
 - `runner_os`:`lsb_release` 或 `/etc/os-release`。
 - `llama_commit`:`fetch_llamacpp.sh` 回校的 SHA。
 
+## T3 perplexity JSON schema(新增,与 speed JSON 分文件存放)
+
+`results/<timestamp>-perplexity-<variant>-<quant>.json`,4 份(naive×3 quants + kleidiai-q4_0 spot-check):
+
+```
+variant, quant, model, model_revision, model_sha256, model_size_mb,
+perplexity, perplexity_stddev, perplexity_formula,
+n_chunks, n_ctx, chunks_tokens, wikitext_sha256,
+llama_commit, timestamp
+```
+
+- `perplexity` / `perplexity_stddev`:正则解析 `llama-perplexity` 输出 `Final estimate: PPL = X +/- Y`(走 stderr);**不要传 `--ppl-stride`**(走 v2 不打印汇总行)。
+- `n_chunks` / `n_ctx` / `chunks_tokens`:`--chunks 8` / `-c 512` / `n_chunks × n_ctx`(=4096 tokens);G7 断言四份 JSON 此三字段一致。
+- `wikitext_sha256`:wikitext-2 test set sha256(`https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip` → `wikitext-2-raw/wiki.test.raw`,仓库无 pin → CI 首次下载算并断言)。
+- perplexity 是"量化"的属性 → 在数值参考档(naive)上测 3 量化;优化档抽 kleidiai-Q4_0 做 spot-check(容差 <2%,确认 KleidiAI 不改数值)。
+
+## T3 决策表(`results/<timestamp>-decision-table.md`)
+
+每量化一行,列 = `quant | 体积MB | 最佳档 | prefill tok/s | decode tok/s | perplexity | 峰值内存MB(最佳档) | 最优优化路径 | PPL spot-check`。最佳档判据:decode tok/s 最高,若两档 decode 差<3% 取峰值内存更低者(G5)。附 Q8_0 KleidiAI vs repack headline insight + G5/G7 说明。
+
 ## 后续阶段
 
-- **T2**(进行中):五档构建矩阵 × 两量化同机对照(2D:5 variants × Q4_K_M+Q4_0,`build_variant.sh` + 激活探针 4 字段运行时真检测)——实现完整 R3,严格遵守 NF4 同机对照(同 job/同 runner 连续跑完,结论只用 speedup ratio,分母按量化各自 naive)。G1 探针交叉验证 / G2 Q4_0 双优化交互 / G3 50min 红线。
-- **T3**:多量化对照(Q4_0/Q4_K_M/Q8_0 + perplexity 质量列)——实现 R4。
+- **T2**(已完成):五档构建矩阵 × 两量化同机对照(2D:5 variants × Q4_K_M+Q4_0,`build_variant.sh` + 激活探针 4 字段运行时真检测)——实现完整 R3,严格遵守 NF4 同机对照(同 job/同 runner 连续跑完,结论只用 speedup ratio,分母按量化各自 naive)。G1 探针交叉验证 / G2 Q4_0 双优化交互 / G3 50min 红线。T2 实测两条 insight(已采信):Q4_0 上 KleidiAI 相对 repack 边际收益≈0;repack 以 ~1.7× 峰值内存换速度。
+- **T3**(进行中):多量化对照(Q4_0/Q4_K_M/Q8_0 + perplexity 质量列)——实现 R4。三量化 × 五档 = 15 速度基准 + 4 份 perplexity(naive×3 + kleidiai-Q4_0 spot-check)+ "选哪个量化"决策表(G5 内存 tie-break)+ Q8_0 KleidiAI vs repack headline + Performix PMU 探针(T3b 非阻塞)。护栏 G4(结果不丢:perplexity step timeout + `if: always()` commit)/ G5(内存 tie-break)/ G6(降级顺序:先砍 spot-check 再统一降 chunks)/ G7(4 份 PPL params 公平性断言)。
 - **T4**:一键基准 `run_bench.sh` + 静态看板——实现 R5。
 - **T5**:Arm Performix 接入 + 迁移模板 + 优化配方——实现 R6/R7。
 - **T6**:三段式 README 终稿 + ≤3min 演示视频脚本——实现 R8 终稿。

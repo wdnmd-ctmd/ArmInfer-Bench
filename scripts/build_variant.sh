@@ -89,17 +89,26 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
     -DLLAMA_BUILD_SERVER=OFF \
     2>&1 | tee "$BUILD_DIR/cmake_config.log"
 
-# --- Build only llama-bench target (control CI time, G3) ---
-cmake --build "$BUILD_DIR" --target llama-bench -j"$(nproc)"
+# --- Build llama-bench + llama-perplexity targets (T3: perplexity quality column) ---
+# T2 only built llama-bench; T3 adds llama-perplexity for wikitext-2 PPL measurement.
+# ccache keeps core libs shared across variants; only the perplexity binary link is new (~10-20s/variant).
+cmake --build "$BUILD_DIR" --target llama-bench llama-perplexity -j"$(nproc)"
 
 BENCH_BIN="$BUILD_DIR/bin/llama-bench"
 if [[ ! -x "$BENCH_BIN" ]]; then
     echo "::error::llama-bench not found at $BENCH_BIN" >&2
     exit 1
 fi
-
 echo "=== llama-bench binary ==="
 "$BENCH_BIN" --version || true
+
+PPL_BIN="$BUILD_DIR/bin/llama-perplexity"
+if [[ ! -x "$PPL_BIN" ]]; then
+    echo "::error::llama-perplexity not found at $PPL_BIN" >&2
+    exit 1
+fi
+echo "=== llama-perplexity binary ==="
+"$PPL_BIN" --version || true
 
 # ============================================================================
 # Build-time activation probes (G1). Runtime probes captured per-bench in bench.yml.
