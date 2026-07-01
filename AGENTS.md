@@ -71,9 +71,15 @@
 
 pinned commit `fabde3b` 上核对:KleidiAI 微内核**仅覆盖 Q4_0 和 Q8_0**(`kleidiai.cpp:296-305` `kleidiai_get_block_args` 只两 case;`kernels.cpp:868-902` `select_kernels` 只匹配 Q4_0/Q8_0 表)。**对 Q4_K_M 完全 no-op**(`select_kernels` 返回 nullptr)。
 
-- **Q4_K_M 表**:kleidiai_only/kleidiai 两档 `kleidiai_active` 实测应为 false、`offloaded=0`,speedup ≈ norepack(噪声内)。如实记录,不许掩饰。
-- **Q4_0 表**:KleidiAI 真接管,展示真实加速比。
+- **Q4_K_M 表**:kleidiai_only/kleidiai 两档 `kleidiai_active` 实测应为 false(source=`no_runtime_takeover_kquant_noop`)、`offloaded=null`(b9728 op 静默无张量计数日志,source=`unavailable_in_build_log`),speedup ≈ norepack(噪声内)。如实记录,不许掩饰。
+- **Q4_0 表**:KleidiAI 真接管,`kleidiai_active=true`(source=`verbose_log_primary_kernel`)、`offloaded=null`(b9728 op 成功调用静默无 LOG,以 active 布尔作接管证据),展示真实加速比。
 - 这正是 T2 升级为 2D 矩阵(五档 × Q4_K_M+Q4_0)的根因。
+
+#### 诚实 insight(T2 实测,总监已采信)
+
+- **Q4_0 上 KleidiAI 相对自带 repack 边际收益≈0**:kleidiai_only 与 repack 在 Q4_0 上 speedup 持平,kleidiai 档(双 ON)也无叠加增益。KleidiAI 价值在「不依赖 repack 也能拿到同等速度」而非「比 repack 更快」。
+- **repack 以 ~1.7× 峰值内存换速度**:repack 档峰值内存显著高于 norepack(在线 Q4_0→Q4_X_X 重排代价),报告须点明「内存换速度」trade-off。
+- **Q8_0(KleidiAI 收益最大档)留给 T3**,不在本轮 scope。
 
 ### repack 覆盖范围
 
@@ -86,13 +92,13 @@ repack 覆盖 Q4_0(→Q4_X_X)和 Q4_K(Q4_K_M 真生效,ARM i8mm 走 `q4_K_8x8_q8
 | 字段 | 含义 | 采集方法 |
 |------|------|---------|
 | `kleidiai_compiled` | 符号是否链入(bool) | `nm llama-bench \| grep kai_` 计数 >0(definitive,条件编译) |
-| `kleidiai_active` | 运行时是否真选中 KleidiAI buffer(bool) | `llama-bench -v` 日志 grep `kleidiai:` + kernel/buffer 关键字;**verbose_log 唯一可单独支撑 active 断言** |
-| `kleidiai_tensors_offloaded` | 分配到 KleidiAI buffer 的张量数(int) | 解析 `-v` 日志;无法解析 → -1 |
+| `kleidiai_active` | 运行时是否真接管 KleidiAI 微内核(bool) | 严格白名单:compiled AND 量化在 KleidiAI 覆盖内(Q4_0/Q8_0)AND `-v` 日志含 `kleidiai: primary q4/q8 kernel`;**排除 init/registered/loaded/available 等模块初始化噪声**(b9728 `primary q4 kernel` 日志基于 CPU features 在 init 阶段对所有量化打印,非 per-model 接管信号)。Q4_K_M 落 `no_runtime_takeover_kquant_noop`。**verbose_log 唯一可单独支撑 active 断言** |
+| `kleidiai_tensors_offloaded` | 分配到 KleidiAI buffer 的张量数(int/null) | b9728 op 成功调用静默无 LOG,不打印张量计数 → **null + source=`unavailable_in_build_log`**(诚实标"测不到",不留 -1 像报错) |
 | `repack_active` | 重排是否生效(bool) | `-v` 日志 grep `repack tensor`;verbose_log 优先 |
 
 **采集优先级(G1)**:`verbose_log`(运行时真证据,唯一可单独支撑 active)> `cmake_inferred`/`compiled_inferred`(最后兜底,绝不单独作为 active 依据)> `inconclusive_*`(拿不到证据+行为含糊,不硬断言)。
 
-**行为交叉验证(G1)**:Q4_0 上 kleidiai_only 实测须显著 ≠ norepack(>5%);Q4_K_M 上须 ≈ norepack(<3% 噪声内)。含糊即标 inconclusive。
+**行为交叉验证(G1)**:Q4_0 上 kleidiai_only 实测须显著 ≠ norepack(>5%);Q4_K_M 上须 ≈ norepack(<3% 噪声内)。含糊即标 inconclusive。**自动一致性断言**:CI 内对 kleidiai_only 每量化算 pp/tg speedup(vs norepack)——`active=true` 但 speedup≈1(±5% 内)→ `::error::` + `sys.exit(1)`(探针与 no-op 行为矛盾);`active=false` 但 Q4_0/Q8_0 上 speedup>1.10 → `::error::` + `sys.exit(1)`(行为显示真接管探针漏判)。让探针与行为永远对得上。
 
 **Q4_0 双优化叠加(G2)**:kleidiai 档(repack+KleidiAI 都 ON)在 Q4_0 上两者可能竞争同一批张量,探针记录实际接管者,别把 repack 收益记到 KleidiAI 头上。
 
@@ -150,8 +156,8 @@ ttft_ms, ttft_formula, peak_mem_mb, peak_mem_source,
 n_threads, cpu_model, cpu_features, compiler, llama_commit, runner_os, timestamp,
 # T2 激活探针(4 字段 + source 标注):
 kleidiai_compiled, kleidiai_active, kleidiai_tensors_offloaded, repack_active,
-kleidiai_active_source, repack_active_source, kleidiai_compiled_nm_count,
-repack_cmake_state, kleidiai_cmake_state
+kleidiai_active_source, kleidiai_tensors_offloaded_source, repack_active_source,
+kleidiai_compiled_nm_count, repack_cmake_state, kleidiai_cmake_state
 ```
 
 字段来源说明:
