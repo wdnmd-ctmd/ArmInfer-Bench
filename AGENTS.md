@@ -10,7 +10,7 @@
 
 ## 本轮范围
 
-**W1 = T0 + T1**。T0 仓库脚手架(本批);T1 基线 CI(bench.yml,arm64,naive 档冒烟)。事实来源:`.trae/specs/bootstrap-arm-infer-bench/spec.md`。T2–T6 为后续阶段,本轮不执行。
+**W1 = T0 + T1**(已完成,naive baseline 锚点已立)。**W2 = T2**(进行中:五档 × 两量化同机对照)。事实来源:`.trae/specs/bootstrap-arm-infer-bench/spec.md`。T3–T6 为后续阶段。
 
 ## 目录结构
 
@@ -65,6 +65,39 @@
 - **诚实标注**:`repack.cpp` 仍被编译进二进制(单档构建 `GGML_CPU_SOURCES` 无条件包含),`GGML_CPU_REPACK=OFF` 时运行时不做重排;naive 仍含 NEON。
 - 候选 `GGML_CPU_AARCH64` **不存在**;运行时 env var / 版本默认行为均非关闭途径。
 
+## KleidiAI 覆盖范围与激活探针(T2 已核对)
+
+### KleidiAI 覆盖范围(k-quant no-op gotcha)
+
+pinned commit `fabde3b` 上核对:KleidiAI 微内核**仅覆盖 Q4_0 和 Q8_0**(`kleidiai.cpp:296-305` `kleidiai_get_block_args` 只两 case;`kernels.cpp:868-902` `select_kernels` 只匹配 Q4_0/Q8_0 表)。**对 Q4_K_M 完全 no-op**(`select_kernels` 返回 nullptr)。
+
+- **Q4_K_M 表**:kleidiai_only/kleidiai 两档 `kleidiai_active` 实测应为 false、`offloaded=0`,speedup ≈ norepack(噪声内)。如实记录,不许掩饰。
+- **Q4_0 表**:KleidiAI 真接管,展示真实加速比。
+- 这正是 T2 升级为 2D 矩阵(五档 × Q4_K_M+Q4_0)的根因。
+
+### repack 覆盖范围
+
+repack 覆盖 Q4_0(→Q4_X_X)和 Q4_K(Q4_K_M 真生效,ARM i8mm 走 `q4_K_8x8_q8_K`)。对 Q4_K_M 真生效,对 Q4_0 也生效。
+
+### 激活探针机制(4 字段,运行时真检测)
+
+每档每量化各记 4 个探针字段(总监 W2 裁定,G1 不许循环论证):
+
+| 字段 | 含义 | 采集方法 |
+|------|------|---------|
+| `kleidiai_compiled` | 符号是否链入(bool) | `nm llama-bench \| grep kai_` 计数 >0(definitive,条件编译) |
+| `kleidiai_active` | 运行时是否真选中 KleidiAI buffer(bool) | `llama-bench -v` 日志 grep `kleidiai:` + kernel/buffer 关键字;**verbose_log 唯一可单独支撑 active 断言** |
+| `kleidiai_tensors_offloaded` | 分配到 KleidiAI buffer 的张量数(int) | 解析 `-v` 日志;无法解析 → -1 |
+| `repack_active` | 重排是否生效(bool) | `-v` 日志 grep `repack tensor`;verbose_log 优先 |
+
+**采集优先级(G1)**:`verbose_log`(运行时真证据,唯一可单独支撑 active)> `cmake_inferred`/`compiled_inferred`(最后兜底,绝不单独作为 active 依据)> `inconclusive_*`(拿不到证据+行为含糊,不硬断言)。
+
+**行为交叉验证(G1)**:Q4_0 上 kleidiai_only 实测须显著 ≠ norepack(>5%);Q4_K_M 上须 ≈ norepack(<3% 噪声内)。含糊即标 inconclusive。
+
+**Q4_0 双优化叠加(G2)**:kleidiai 档(repack+KleidiAI 都 ON)在 Q4_0 上两者可能竞争同一批张量,探针记录实际接管者,别把 repack 收益记到 KleidiAI 头上。
+
+**CI 时长红线(G3)**:timeout 60min,逼近 50min 先停报告。严禁为省时拆到不同 job/runner(破坏 NF4)。
+
 ## naive 诚实标注
 
 `naive` 为 **armv8-a 基础基线**,构建参数为 `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a -DGGML_CPU_KLEIDIAI=OFF -DGGML_CPU_REPACK=OFF`。
@@ -100,6 +133,8 @@ TTFT 用 `llama-bench` 的 prompt-processing(prefill)吞吐推算,**不要用 `l
 
 - **同 job 同 runner**:同一组对照(naive vs 各优化档)必须在同一个 GitHub Actions job、同一台 runner 内连续跑完。不同 job/不同 runner 的绝对数字**不可直接对比**,仅作参考。
 - **结论只用同机比值**:作品的优化结论只采用「同机 speedup ratio」(如 `decode_tok_s_kleidiai / decode_tok_s_naive`),绝对值仅作参考。
+- **分母按量化各自 naive**:T2 2D 矩阵下,Q4_K_M 表分母 = 本 job 现跑的 naive-q4_k_m;Q4_0 表分母 = 本 job 现跑的 naive-q4_0。绝不用历史 naive 当分母。
+- **cpu_model 友好名映射**:`CPU part` 0xd49 → Neoverse-N2,写入 JSON 的 `cpu_model`(如 `Neoverse-N2 (implementer=0x41 part=0xd49)`)。
 - **runner CPU 型号记录**:`cpu_model` 解析自 `/proc/cpuinfo` 的 `CPU part`/`CPU implementer` 或 `lscpu`(如 Neoverse-N2 / Cobalt-100),写入 JSON 的 `cpu_model`。
 - **W1 起即记录**:W1 虽只有 naive 单档,`cpu_model` 也必须从第一条数据开始记录,为后续同机比值提供基准锚点。
 
@@ -112,7 +147,11 @@ variant, quant, model, model_revision, model_sha256, model_size_mb,
 bench_args, pp_n, tg_n, reps,
 prefill_tok_s, prefill_stddev, decode_tok_s, decode_stddev,
 ttft_ms, ttft_formula, peak_mem_mb, peak_mem_source,
-n_threads, cpu_model, cpu_features, compiler, llama_commit, runner_os, timestamp
+n_threads, cpu_model, cpu_features, compiler, llama_commit, runner_os, timestamp,
+# T2 激活探针(4 字段 + source 标注):
+kleidiai_compiled, kleidiai_active, kleidiai_tensors_offloaded, repack_active,
+kleidiai_active_source, repack_active_source, kleidiai_compiled_nm_count,
+repack_cmake_state, kleidiai_cmake_state
 ```
 
 字段来源说明:
@@ -130,7 +169,7 @@ n_threads, cpu_model, cpu_features, compiler, llama_commit, runner_os, timestamp
 
 ## 后续阶段
 
-- **T2**:五档构建矩阵(`build_variant.sh` + 激活探针自证 KleidiAI/重排是否接管)——实现完整 R3,严格遵守 NF4 同机对照(同 job/同 runner 连续跑完,结论只用 speedup ratio)。
+- **T2**(进行中):五档构建矩阵 × 两量化同机对照(2D:5 variants × Q4_K_M+Q4_0,`build_variant.sh` + 激活探针 4 字段运行时真检测)——实现完整 R3,严格遵守 NF4 同机对照(同 job/同 runner 连续跑完,结论只用 speedup ratio,分母按量化各自 naive)。G1 探针交叉验证 / G2 Q4_0 双优化交互 / G3 50min 红线。
 - **T3**:多量化对照(Q4_0/Q4_K_M/Q8_0 + perplexity 质量列)——实现 R4。
 - **T4**:一键基准 `run_bench.sh` + 静态看板——实现 R5。
 - **T5**:Arm Performix 接入 + 迁移模板 + 优化配方——实现 R6/R7。
