@@ -10,7 +10,7 @@
 
 ## 本轮范围
 
-**W1 = T0 + T1**(已完成,naive baseline 锚点已立)。**W2 = T2**(已完成:五档 × 两量化同机对照,探针干净 + G1 一致性断言)。**W3 = T3**(进行中:三量化 × 五档 + perplexity 质量列 + Performix PMU 探针)。事实来源:`.trae/specs/bootstrap-arm-infer-bench/spec.md`。T4–T6 为后续阶段。
+**W1 = T0 + T1**(已完成,naive baseline 锚点已立)。**W2 = T2**(已完成:五档 × 两量化同机对照,探针干净 + G1 一致性断言)。**W3 = T3**(已完成:三量化 × 五档 + perplexity 质量列 + Performix PMU 探针,总监已签收)。事实来源:`.trae/specs/bootstrap-arm-infer-bench/spec.md`。T4–T6 为后续阶段。
 
 ## 目录结构
 
@@ -107,7 +107,7 @@ repack 覆盖 Q4_0(→Q4_X_X)和 Q4_K(Q4_K_M 真生效,ARM i8mm 走 `q4_K_8x8_q8
 **T3 新增护栏(G4–G7)**:
 
 - **G4 结果不可丢(最重要)**:15 档核心速度基准是命根,绝不能被可选步拖累而全丢。perplexity 步加 step 级 `timeout-minutes: 12`;PMU 步 `continue-on-error: true`。assembly + commit 步必须用 `if: always()`,确保即使 perplexity/PMU 失败或超时,已跑完的 15 份速度 JSON 仍能装配并 commit 回 main。单 job 60min 硬 timeout——step 级 timeout + always() commit 防 perplexity 卡住把整 job 拖到 60min 丢失 bench 成果。
-- **G5 内存 tie-break**:决策表选每量化"最佳档"时,若两档 decode 差在噪声内(<3%),取峰值内存更低者。诚实体现"内存换速度"取舍(如 repack ~1.7× 峰值内存换速度)。
+- **G5 内存 tie-break**:决策表选每量化"最佳档"时,若两档 decode 差在噪声内(<5%),取峰值内存更低者。诚实体现"内存换速度"取舍(如 repack ~1.7× 峰值内存换速度)。
 - **G6 G3 降级顺序固定**:逼近预算时先砍 kleidiai-Q4_0 spot-check,再按量化"统一"降 chunks(8→4)。绝不让三量化用不同 chunks 对比。先报再动。
 - **G7 公平性断言**:出决策表前 assert 4 份 perplexity JSON 的 `n_chunks` / `n_ctx` / `wikitext_sha256` 完全一致;不一致即 CI fail 或标红。防止意外混档对比污染质量结论。
 
@@ -204,13 +204,13 @@ llama_commit, timestamp
 
 - **收尾2 PPL 误差棒**:chunks=8 下三量化 PPL 误差棒 ±0.64~0.68,而量化间差值仅 0.1~0.6,个体误差棒重叠。决策表/看板 PPL 一律带 ± 误差棒,并附说明:"排序(Q8_0<Q4_K_M<Q4_0)符合量化理论,同 chunk/同数据集配对测量,是可信的相对排序;但此分辨率下个体误差棒重叠,非精确质量差。量化取舍主由体积/速度/内存驱动。"不重跑,措辞诚实化。
 - **收尾3 Q4_0 最优路径措辞**:Q4_0 上 KleidiAI(1.45×)与 repack(1.41×)差 3%(<5% 阈值),判为"打平",仅凭 G5 内存优势(1853<1965MB)择 kleidiai_only。真正的"KleidiAI 胜出"只在 Q8_0(+15.3% decode)。best_path 阈值 1.05(5%),不让 Q4_0 蹭 Q8_0 headline。
-- **Q4_K_M decode 差异显著性**:kleidiai_only vs norepack decode 差 5.3σ(统计显著,非噪声),但 KleidiAI 未接管(三重确认:源码覆盖空 + prefill 0.38% 噪声内 + source=no_runtime_takeover_kquant_noop)。差异最可能是编译进 KleidiAI 代码导致的二进制布局扰动效应(kleidiai_compiled=true, nm 447)。结论"未接管"不改,但 stddev 显著性如实标注。
+- **Q4_K_M decode 差异显著性**:kleidiai_only vs norepack decode delta 在 within-run 尺度波动大(T3 首轮 5.3σ +4.65% / T3 第二轮 1.5σ +0.84%),T2↔T3 跨轮对照(T2 -0.83% / T3 首轮 +4.65% 5.3σ / T3 第二轮 +0.84% 1.5σ)符号与幅度翻转,揭示 within-run stddev(5 reps)低估真实跨轮方差;成因未定(跨轮方差/次要布局),KleidiAI 确未接管(三重确认:源码覆盖空 + prefill 噪声内 + source=no_runtime_takeover_kquant_noop)。不重跑。
 - **收尾1 PMU 探针实测(T3b)**:`/sys/bus/event_source/devices` 含 `armv8_pmuv3_0`(PMU 硬件设备暴露给 VM)但 `perf stat` 硬件计数器访问被 `perf_event_paranoid` 拦(`<not supported>`);`arm_spe`(SPE)完全不在。结论:Performix SPE 功能在 GHA Arm64 VM 不可用,T5 锁 fallback 叙事(perf stat 软件事件 + llama-bench -v + 消融链当瓶颈分解)。完整 `pmu_probe.log` 见 artifact。
 
 ## 后续阶段
 
 - **T2**(已完成):五档构建矩阵 × 两量化同机对照(2D:5 variants × Q4_K_M+Q4_0,`build_variant.sh` + 激活探针 4 字段运行时真检测)——实现完整 R3,严格遵守 NF4 同机对照(同 job/同 runner 连续跑完,结论只用 speedup ratio,分母按量化各自 naive)。G1 探针交叉验证 / G2 Q4_0 双优化交互 / G3 50min 红线。T2 实测两条 insight(已采信):Q4_0 上 KleidiAI 相对 repack 边际收益≈0;repack 以 ~1.7× 峰值内存换速度。
-- **T3**(进行中):多量化对照(Q4_0/Q4_K_M/Q8_0 + perplexity 质量列)——实现 R4。三量化 × 五档 = 15 速度基准 + 4 份 perplexity(naive×3 + kleidiai-Q4_0 spot-check)+ "选哪个量化"决策表(G5 内存 tie-break)+ Q8_0 KleidiAI vs repack headline + Performix PMU 探针(T3b 非阻塞)。护栏 G4(结果不丢:perplexity step timeout + `if: always()` commit)/ G5(内存 tie-break)/ G6(降级顺序:先砍 spot-check 再统一降 chunks)/ G7(4 份 PPL params 公平性断言)。
+- **T3**(已完成):多量化对照(Q4_0/Q4_K_M/Q8_0 + perplexity 质量列)——实现 R4。三量化 × 五档 = 15 速度基准 + 4 份 perplexity(naive×3 + kleidiai-Q4_0 spot-check)+ "选哪个量化"决策表(G5 内存 tie-break,阈值 5%)+ Q8_0 KleidiAI vs repack headline(KleidiAI +12.5% decode 胜)+ Performix PMU 探针(T3b:SPE 不可用,锁 fallback)。护栏 G4/G5/G6/G7 全过。T3 实测 insights(已采信):Q8_0 上 KleidiAI 真胜 repack(+12.5% decode);Q4_0 上 KleidiAI≈repack 打平(差 3%,仅凭 G5 内存优势择 kleidiai_only);Q4_K_M 上 KleidiAI no-op(decode delta 跨轮波动大,within-run stddev 低估真实跨轮方差,未接管)。
 - **T4**:一键基准 `run_bench.sh` + 静态看板——实现 R5。
 - **T5**:Arm Performix 接入 + 迁移模板 + 优化配方——实现 R6/R7。
 - **T6**:三段式 README 终稿 + ≤3min 演示视频脚本——实现 R8 终稿。

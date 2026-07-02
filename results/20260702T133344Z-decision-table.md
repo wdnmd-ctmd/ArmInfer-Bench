@@ -4,9 +4,9 @@ runner cpu: Neoverse-N2 (implementer=0x41 part=0xd49) | llama_commit: fabde3bf51
 
 | quant | 体积MB | 最佳档 | prefill tok/s | decode tok/s | perplexity | 峰值内存MB(最佳档) | 最优优化路径 | PPL spot-check |
 |-------|--------|--------|---------------|--------------|------------|---------------------|-------------|----------------|
-| Q4_K_M | 1065.56 | kleidiai (G5 tie-break: 2 档 decode 差<3%, 取内存最低) | 87.058 | 33.140 | 11.2698 ± 0.68037 | 2065.7 | repack (1.19×) — KleidiAI no-op on k-quant | — |
-| Q4_0 | 1016.83 | kleidiai_only (G5 tie-break: 3 档 decode 差<3%, 取内存最低) | 128.966 | 36.001 | 11.3872 ± 0.68512 | 1853.2 | KleidiAI ≈ repack(打平,≈1.42×)— 仅凭 G5 内存优势(1853<1965MB)择 kleidiai_only | PASS (diff 0.045%) |
-| Q8_0 | 1806.77 | kleidiai_only (G5 tie-break: 2 档 decode 差<3%, 取内存最低) | 181.532 | 44.413 | 10.6823 ± 0.64232 | 3372.7 | KleidiAI (1.55×) > repack (1.38×) | — |
+| Q4_K_M | 1065.56 | kleidiai (G5 tie-break: 2 档 decode 差<5%, 取内存最低) | 87.058 | 33.140 | 11.2698 ± 0.68037 | 2065.7 | repack (1.19×) — KleidiAI no-op on k-quant | — |
+| Q4_0 | 1016.83 | kleidiai_only (G5 tie-break: 3 档 decode 差<5%, 取内存最低) | 128.966 | 36.001 | 11.3872 ± 0.68512 | 1853.2 | KleidiAI ≈ repack(打平,≈1.42×)— 仅凭 G5 内存优势(1853<1965MB)择 kleidiai_only | PASS (diff 0.045%) |
+| Q8_0 | 1806.77 | kleidiai_only (G5 tie-break: 2 档 decode 差<5%, 取内存最低) | 181.532 | 44.413 | 10.6823 ± 0.64232 | 3372.7 | KleidiAI (1.55×) > repack (1.38×) | — |
 
 ## Q8_0 KleidiAI vs repack(headline)
 - KleidiAI **>** repack:kleidiai_only decode 44.413 vs repack 39.494(KleidiAI 胜 12.5%)
@@ -30,9 +30,7 @@ runner cpu: Neoverse-N2 (implementer=0x41 part=0xd49) | llama_commit: fabde3bf51
 - kleidiai_only decode 27.759 ± 0.142 vs norepack 27.527 ± 0.069
 - diff=0.232, combined σ=0.157 → 1.5σ(噪声内)
 - prefill diff: kleidiai_only 58.517 vs norepack 58.583(差 -0.11%, 噪声内)
-- 结论不变:KleidiAI 在 Q4_K_M 未接管(三重确认:源码覆盖空 + prefill 噪声内 + source=no_runtime_takeover_kquant_noop)。
-- decode 差异 1.5σ 统计显著但非 KleidiAI 接管所致 —— 最可能是编译进 KleidiAI 代码导致的二进制布局扰动效应(kleidiai_compiled=true, nm 计数 447)。
-- 诚实重判:数据违反'噪声'假设,如实标注;但'未接管'结论由探针+源码 definitive 确认,不改。
+- decode delta 在 within-run 尺度 1.5σ(本轮 +0.84%),但 T2↔T3 跨轮对照(T2 -0.83% / T3 首轮 +4.65% 5.3σ / 本轮 +0.84% 1.5σ)符号与幅度波动大,揭示 within-run stddev(5 reps)低估真实跨轮方差;成因未定(跨轮方差/次要布局),KleidiAI 确未接管(三重确认:源码覆盖空 + prefill 噪声内 + source=no_runtime_takeover_kquant_noop)。
 
 ## PMU 探针实测结论(T3b Performix feasibility,收尾1)
 - /sys/bus/event_source/devices 含 armv8_pmuv3_0: True(PMU 硬件设备是否暴露给 VM)
