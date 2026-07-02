@@ -1,4 +1,4 @@
-> 本轮范围:W1 = T0 + T1。事实来源见 `.trae/specs/bootstrap-arm-infer-bench/spec.md`。
+> 进度:W1–W3(T0–T3)已完成,T4 一键基准 + 静态看板进行中。事实来源见 `.trae/specs/bootstrap-arm-infer-bench/spec.md`。
 
 # ArmInfer-Bench
 
@@ -15,16 +15,16 @@ ArmInfer-Bench 是一个开源、纯 GitHub Actions Arm64 runner(`runs-on: ubunt
 - **五档构建矩阵**:`naive / norepack / repack / kleidiai_only / kleidiai`,逐因子拆开 i8mm 指令、llama.cpp 自带 ARM 重排、KleidiAI 微内核三个优化的净贡献。
 - **多量化对照**:`Q4_0 / Q4_K_M / Q8_0`,比较体积、速度、质量(perplexity)。
 - **基准采集**:用 `llama-bench` 钉死参数(`-t 4 -p 512 -n 128 -r 5`)采集 prefill/decode tok/s(+stddev)、推算 TTFT、`/usr/bin/time -v` 取峰值内存。
-- **静态看板**:读 `results/*.json` 渲染 HTML/Markdown 结果(本轮占位)。
-- **复用资产**:优化构建配方、迁移模板、AGENTS.md(本轮骨架就位)。
-- **本轮仅落地 `naive` 档冒烟基线**(Qwen2.5-1.5B-Instruct Q4_K_M),五档矩阵与多量化在后续阶段展开。
+- **静态看板**:GitHub Pages 托管,纯前端 vanilla JS,fetch 同目录 `docs/data/dashboard.json`(由 `scripts/assemble_results.py` 自包含产出,避免 Pages 跨目录 404),展示同机 speedup vs naive、决策表、PMU 探针、激活探针矩阵。
+- **复用资产**:优化构建配方、迁移模板、AGENTS.md(骨架就位,配方在 T5 产出)。
+- **已落地范围**:W1–W3 已完成五档 × 三量化(Q4_0/Q4_K_M/Q8_0)同机对照 + perplexity 质量列 + PMU 探针;T4 一键基准 + 静态看板进行中。
 
 ## Setup
 
-Arm64 从零复跑,本轮有两条路径:
+Arm64 从零复跑,有两条路径:
 
-1. **GitHub Actions(推荐,本轮主路径)**:在仓库 Actions 页手动触发 `.github/workflows/bench.yml` 的 `workflow_dispatch`,在 `ubuntu-24.04-arm` runner 上自动完成「构建 → 下载模型 → 基准 → 输出 JSON artifact」。
-2. **本地 aarch64 Linux**:`bash scripts/run_bench.sh` 一键复现。> 注:`run_bench.sh` 在 T4 阶段才完整,本轮先以 CI 为准;本地等价步骤参见 `scripts/fetch_llamacpp.sh` + `AGENTS.md` 的构建参数。
+1. **GitHub Actions(推荐)**:在仓库 Actions 页手动触发 `.github/workflows/bench.yml` 的 `workflow_dispatch`,在 `ubuntu-24.04-arm` runner 上自动完成「构建 → 下载模型 → 基准 → 装配 JSON + 看板数据 → commit 回 main + artifact」。
+2. **本地 aarch64 Linux**:`bash scripts/run_bench.sh` 一键复现(等价 CI 全流程:构建五档 → 下载 GGUF → 跑 15 次基准 + perplexity → 调 `assemble_results.py` 装配结果)。CI 与本地共用同一份 `fetch_llamacpp.sh` / `build_variant.sh` / `assemble_results.py`,保证一致。
 
 **Prerequisites**(本地路径需要):
 
@@ -34,6 +34,7 @@ Arm64 从零复跑,本轮有两条路径:
 - `ccache`(跨档共享 llama/ggml 核心目标,控制编译时间)
 - `curl` 或 `wget`(下载 GGUF,加重试)
 - C/C++ 工具链(`gcc`/`g++` 或 `clang`)
+- `python3` ≥ 3.8(装配结果 + 看板数据)
 
 ## Naive baseline 说明
 

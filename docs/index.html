@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ArmInfer-Bench Dashboard</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- P3②: fetch 失败或字段缺失时显示占位报错 -->
+    <div id="error-placeholder" class="error-placeholder hidden">
+      <h2>暂无数据</h2>
+      <p>无法加载 <code>./data/dashboard.json</code>。请确认 assemble_results.py 已运行并产出数据文件。</p>
+      <p id="error-detail"></p>
+    </div>
+
+    <div id="content" class="hidden">
+      <!-- a. Header -->
+      <header class="header">
+        <h1>ArmInfer-Bench Dashboard</h1>
+        <div class="meta" id="meta"></div>
+        <div class="timestamp-switcher">
+          <label for="ts-select">Run:</label>
+          <select id="ts-select"></select>
+        </div>
+      </header>
+
+      <!-- b. Headline 卡片 (P2: 数字引用 headlines 单一计算) -->
+      <section class="headlines">
+        <h2>Headline 结论</h2>
+        <div class="card-grid" id="headline-cards"></div>
+      </section>
+
+      <!-- c. 默认视图: 同机 speedup vs naive (NF4) -->
+      <section class="speedup-section">
+        <h2>同机 Speedup vs Naive <span class="subtitle">(NF4 — 分母 = 本 job naive)</span></h2>
+        <div class="tabs" id="quant-tabs"></div>
+        <div class="table-container" id="speedup-table"></div>
+      </section>
+
+      <!-- d. 决策表 -->
+      <section class="decision-section">
+        <h2>选哪个量化:决策表</h2>
+        <div id="decision-table"></div>
+      </section>
+
+      <!-- e. PMU/Performix -->
+      <section class="pmu-section">
+        <h2>PMU / Performix 实测结论</h2>
+        <div id="pmu-summary"></div>
+      </section>
+
+      <!-- f. 探针明细矩阵 -->
+      <section class="probe-section">
+        <h2>激活探针明细矩阵</h2>
+        <div class="table-container" id="probe-matrix"></div>
+      </section>
+
+      <!-- g. 诚实说明脚注 -->
+      <footer class="footnotes">
+        <h2>诚实说明</h2>
+        <ul>
+          <li><strong>NF4</strong>:结论只用同机 speedup ratio,不同 job/runner 绝对值不可直接对比。</li>
+          <li><strong>TTFT</strong>:推算(512 prefill),公式 <code>ttft_ms = pp_n / prefill_tok_s × 1000</code>,非实测首 token。</li>
+          <li><strong>PPL</strong>:误差棒 ±0.64~0.68 重叠,排序可信但非精确质量差;量化取舍主由体积/速度/内存驱动。</li>
+          <li><strong>G5</strong>:decode 差 &lt;5% 取峰值内存更低者(内存换速度取舍)。</li>
+          <li><strong>naive</strong>:armv8-a 基线,仍含 NEON(非零 SIMD),不开 i8mm/KleidiAI/repack。</li>
+        </ul>
+      </footer>
+    </div>
+  </div>
+  <script src="./app.js"></script>
+</body>
+</html>

@@ -55,6 +55,21 @@ env:
   BENCH_REPS: 5
 
 jobs:
+  smoke-test:
+    # P3③ 防回归:assemble_results.py 冒烟测试 + run_bench.sh 语法检查.
+    # 纯 Python + bash,x86 ubuntu-latest 即可,不占 Arm64 配额,与 bench job 并行.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4.2.2
+
+      - name: Run assemble_results.py smoke test (P3③)
+        run: python scripts/test_assemble_results.py
+
+      - name: bash -n run_bench.sh (syntax check)
+        run: bash -n scripts/run_bench.sh
+
   three-quant-matrix:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
@@ -297,13 +312,18 @@ jobs:
           fi
           echo "::endgroup::"
 
-      - name: Assemble 15 result JSONs + 4 perplexity JSONs + 3 comparison tables + decision table
+      - name: Assemble 15 result JSONs + 4 perplexity JSONs (Phase 1+2)
         # G4: if: always() so 15 speed JSONs are assembled+committed even if perplexity/PMU
         # step timed out or failed. Speed JSONs are the lifeline of this round.
+        # T4: Phase 3+4 (comparison MDs + decision table + manifest + dashboard) extracted to
+        # scripts/assemble_results.py (single source of truth, shared with run_bench.sh).
         if: always()
         run: |
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          echo "TS=$TS"
+          export TS
           python3 - <<'PYEOF'
-          import json, os, re, subprocess, datetime, pathlib, sys
+          import json, os, re, subprocess, pathlib, sys
 
           def sh(cmd):
               return subprocess.check_output(cmd, shell=True, text=True).strip()
@@ -339,7 +359,7 @@ jobs:
                        "q4_0":   os.environ.get('gguf_sha256_q4_0',''),
                        "q8_0":   os.environ.get('gguf_sha256_q8_0','')}
 
-          ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+          ts = os.environ['TS']  # T4: TS generated in bash (shared with assemble_results.py call)
           pathlib.Path('results').mkdir(exist_ok=True)
           records = {}
 
@@ -533,198 +553,7 @@ jobs:
           else:
               print("::warning::PPL spot-check skipped — one or both perplexity runs missing")
 
-          # ===== Phase 3: Generate 3 comparison tables (one per quant) =====
-          def speedup(a, b): return round(a/b, 3) if b else None
-          for Q in quants:
-              naive = records[("naive", Q)]
-              lines = []
-              lines.append(f"# 同机对照表:{Q.upper()} (NF4 — 同 job 同 runner,分母 = 本 job naive-{Q})")
-              lines.append("")
-              lines.append(f"runner cpu: {naive['cpu_model']} | llama_commit: {naive['llama_commit']} | timestamp: {ts}")
-              lines.append("")
-              lines.append("| variant | prefill tok/s | decode tok/s | TTFT ms | peak mem MB | k_compiled | k_active | offloaded | repack_active | pp speedup | tg speedup | ttft ratio | mem ratio | probe sources |")
-              lines.append("|---------|---------------|--------------|---------|-------------|------------|----------|-----------|---------------|------------|------------|-----------|-----------|---------------|")
-              for V in variants:
-                  r = records[(V,Q)]
-                  ps = speedup(r['prefill_tok_s'], naive['prefill_tok_s'])
-                  ds = speedup(r['decode_tok_s'], naive['decode_tok_s'])
-                  tr = speedup(r['ttft_ms'], naive['ttft_ms'])
-                  mr = speedup(r['peak_mem_mb'], naive['peak_mem_mb'])
-                  src = f"k:{r['kleidiai_active_source']}; r:{r['repack_active_source']}"
-                  off_disp = 'null' if r['kleidiai_tensors_offloaded'] is None else r['kleidiai_tensors_offloaded']
-                  lines.append(f"| {V} | {r['prefill_tok_s']:.3f} | {r['decode_tok_s']:.3f} | {r['ttft_ms']:.1f} | {r['peak_mem_mb']:.1f} | {r['kleidiai_compiled']} | {r['kleidiai_active']} | {off_disp} | {r['repack_active']} | {ps} | {ds} | {tr} | {mr} | {src} |")
-              # G1 behavior cross-check (kleidiai_only vs norepack).
-              npp = records[("norepack",Q)]['prefill_tok_s']
-              kpp = records[("kleidiai_only",Q)]['prefill_tok_s']
-              ntg = records[("norepack",Q)]['decode_tok_s']
-              ktg = records[("kleidiai_only",Q)]['decode_tok_s']
-              pp_diff = abs(kpp-npp)/npp*100 if npp else 0
-              tg_diff = abs(ktg-ntg)/ntg*100 if ntg else 0
-              lines.append("")
-              lines.append("## G1 行为交叉验证(kleidiai_only vs norepack)")
-              lines.append(f"- prefill 差异: {pp_diff:.2f}%  | decode 差异: {tg_diff:.2f}%")
-              if Q in ("q4_0", "q8_0"):
-                  lines.append(f"- 预期:{Q.upper()} 上 KleidiAI 真接管 → kleidiai_only 应**显著 ≠** norepack(差异 >5%)。实测 {'符合' if pp_diff>5 or tg_diff>5 else '不符/可疑 → 标 inconclusive'}。")
-              else:
-                  lines.append(f"- 预期:Q4_K_M 上 KleidiAI no-op → kleidiai_only 应**≈** norepack(差异 <3% 噪声内)。实测 {'符合' if pp_diff<3 and tg_diff<3 else '不符/可疑'}。")
-              lines.append("")
-              lines.append("## 探针采集说明(G1:不许循环论证)")
-              lines.append("- `verbose_log`:从 `llama-bench -v` 运行时日志拿到真证据(优先,唯一可单独支撑 active 断言)。")
-              lines.append("- `cmake_inferred`/`compiled_inferred`:运行时日志无证据时的**最后兜底**,绝不单独作为 active 依据。")
-              lines.append("- `inconclusive_*`:拿不到证据且行为含糊,不硬断言(本表对应格如实标 false + source=inconclusive)。")
-              lines.append("")
-              if Q == "q4_k_m":
-                  lines.append("## KleidiAI k-quant no-op gotcha")
-                  lines.append("- KleidiAI 微内核仅覆盖 Q4_0/Q8_0,对 Q4_K_M 完全 no-op(kleidiai_get_block_args 返回 {0,0,0},op 不被调用)。")
-                  lines.append("- 本表 kleidiai_only/kleidiai 两档 kleidiai_active 应为 false(source=no_runtime_takeover_kquant_noop)、offloaded=null;speedup 应≈ norepack(噪声内)。G1 一致性断言已交叉验证 active 与行为一致。")
-                  lines.append("")
-              if Q == "q4_0":
-                  lines.append("## G2 Q4_0 双优化叠加交互")
-                  lines.append("- kleidiai 档(repack+KleidiAI 都 ON)在 Q4_0 上两者可能竞争同一批张量。")
-                  lines.append("- b9728 KleidiAI op 静默无张量计数日志 -> offloaded=null(source=unavailable_in_build_log),无法用 offloaded 判定接管者。")
-                  lines.append("- 行为判定:kleidiai 档 speedup ~= kleidiai_only ~= repack(三者持平)-> 无叠加收益,实际只一个路径接管,不可把 repack 收益重复记到 KleidiAI 头上。")
-                  lines.append("")
-              if Q == "q8_0":
-                  lines.append("## Q8_0 KleidiAI vs repack(headline)")
-                  k8 = records[("kleidiai_only","q8_0")]; r8 = records[("repack","q8_0")]
-                  lines.append(f"- kleidiai_only decode {k8['decode_tok_s']:.3f} vs repack {r8['decode_tok_s']:.3f}")
-                  if k8['decode_tok_s'] > r8['decode_tok_s'] * 1.05:
-                      lines.append(f"- KleidiAI **>** repack(KleidiAI 胜 {(k8['decode_tok_s']/r8['decode_tok_s']-1)*100:.1f}%)")
-                  elif r8['decode_tok_s'] > k8['decode_tok_s'] * 1.05:
-                      lines.append(f"- repack **>** KleidiAI(repack 胜 {(r8['decode_tok_s']/k8['decode_tok_s']-1)*100:.1f}%)")
-                  else:
-                      lines.append(f"- KleidiAI **≈** repack(打平,差异 <5%)")
-                  lines.append(f"- kleidiai_active(Q8_0) = {k8['kleidiai_active']}(source={k8['kleidiai_active_source']})")
-                  lines.append("- Q8_0 是 KleidiAI 传说中收益最大的档;Q4_0 上 KleidiAI≈repack(打平),Q8_0 上的对比是本轮 headline。")
-                  lines.append("")
-              pathlib.Path(f"results/{ts}-comparison-{Q}.md").write_text("\n".join(lines)+"\n", encoding='utf-8')
-              print(f"=== comparison table {Q} written ===")
-
-          # ===== Phase 4: Decision table ("选哪个量化") =====
-          # G5: best variant by decode tok/s, with memory tie-break if decode within 5% noise.
-          #   若两档 decode 差在噪声内(<5%),取峰值内存更低者(诚实体现内存换速度取舍).
-          dlines = []
-          dlines.append(f"# 选哪个量化:决策表(Qwen2.5-1.5B-Instruct, wikitext-2 PPL, --chunks {ppl_chunks} -c {ppl_ctx})")
-          dlines.append("")
-          dlines.append(f"runner cpu: {cpu_model} | llama_commit: {llama_commit} | timestamp: {ts}")
-          dlines.append("")
-          dlines.append("| quant | 体积MB | 最佳档 | prefill tok/s | decode tok/s | perplexity | 峰值内存MB(最佳档) | 最优优化路径 | PPL spot-check |")
-          dlines.append("|-------|--------|--------|---------------|--------------|------------|---------------------|-------------|----------------|")
-          for Q in quants:
-              # G5: find best variant by decode, with memory tie-break within 5% noise.
-              best_decode = max(records[(v,Q)]['decode_tok_s'] for v in variants)
-              within_noise = [v for v in variants if abs(records[(v,Q)]['decode_tok_s'] - best_decode) / best_decode < 0.05]
-              if len(within_noise) > 1:
-                  best_v = min(within_noise, key=lambda v: records[(v,Q)]['peak_mem_mb'])
-                  tie_note = f" (G5 tie-break: {len(within_noise)} 档 decode 差<5%, 取内存最低)"
-              else:
-                  best_v = within_noise[0]
-                  tie_note = ""
-              r = records[(best_v, Q)]
-              # Determine optimal path: repack or KleidiAI
-              repack_gain = records[("repack",Q)]['decode_tok_s'] / records[("norepack",Q)]['decode_tok_s']
-              kai_gain = records[("kleidiai_only",Q)]['decode_tok_s'] / records[("norepack",Q)]['decode_tok_s']
-              if Q == "q4_k_m":
-                  best_path = f"repack ({repack_gain:.2f}×) — KleidiAI no-op on k-quant"
-              elif kai_gain > repack_gain * 1.05:
-                  best_path = f"KleidiAI ({kai_gain:.2f}×) > repack ({repack_gain:.2f}×)"
-              elif repack_gain > kai_gain * 1.05:
-                  best_path = f"repack ({repack_gain:.2f}×) > KleidiAI ({kai_gain:.2f}×)"
-              else:
-                  # 收尾3: 阈值 1.05(5%)让 Q4_0(kai 1.45 vs repack 1.41,差 3%)落入打平分支.
-                  # 打平时仅凭 G5 内存优势择档,不让 Q4_0 蹭 Q8_0 的 headline. 真正"KleidiAI 胜出"只在 Q8_0.
-                  kai_mem = records[("kleidiai_only",Q)]['peak_mem_mb']
-                  rep_mem = records[("repack",Q)]['peak_mem_mb']
-                  if kai_mem < rep_mem:
-                      best_path = f"KleidiAI ≈ repack(打平,≈{repack_gain:.2f}×)— 仅凭 G5 内存优势({kai_mem:.0f}<{rep_mem:.0f}MB)择 kleidiai_only"
-                  else:
-                      best_path = f"KleidiAI ≈ repack(打平,≈{repack_gain:.2f}×)— 仅凭 G5 内存优势({rep_mem:.0f}<{kai_mem:.0f}MB)择 repack"
-              # PPL column
-              if ("naive",Q) in ppl_records:
-                  pr = ppl_records[("naive",Q)]
-                  ppl_str = f"{pr['perplexity']:.4f} ± {pr['perplexity_stddev']:.5f}"
-              else:
-                  ppl_str = "N/A (timed out)"
-              # Spot-check column
-              if Q == "q4_0":
-                  if spot_check_ok is True:
-                      spot = f"PASS (diff {ppl_diff_pct:.3f}%)"
-                  elif spot_check_ok is False:
-                      spot = f"FAIL (diff {ppl_diff_pct:.3f}%)"
-                  else:
-                      spot = "N/A (missing)"
-              else:
-                  spot = "—"
-              dlines.append(f"| {Q.upper()} | {r['model_size_mb']} | {best_v}{tie_note} | {r['prefill_tok_s']:.3f} | {r['decode_tok_s']:.3f} | {ppl_str} | {r['peak_mem_mb']:.1f} | {best_path} | {spot} |")
-          dlines.append("")
-          # Q8_0 headline insight
-          if ("kleidiai_only","q8_0") in records and ("repack","q8_0") in records:
-              k8 = records[("kleidiai_only","q8_0")]; r8 = records[("repack","q8_0")]
-              dlines.append("## Q8_0 KleidiAI vs repack(headline)")
-              if k8['decode_tok_s'] > r8['decode_tok_s'] * 1.05:
-                  dlines.append(f"- KleidiAI **>** repack:kleidiai_only decode {k8['decode_tok_s']:.3f} vs repack {r8['decode_tok_s']:.3f}(KleidiAI 胜 {(k8['decode_tok_s']/r8['decode_tok_s']-1)*100:.1f}%)")
-              elif r8['decode_tok_s'] > k8['decode_tok_s'] * 1.05:
-                  dlines.append(f"- repack **>** KleidiAI:repack decode {r8['decode_tok_s']:.3f} vs kleidiai_only {k8['decode_tok_s']:.3f}(repack 胜 {(r8['decode_tok_s']/k8['decode_tok_s']-1)*100:.1f}%)")
-              else:
-                  dlines.append(f"- KleidiAI **≈** repack:kleidiai_only {k8['decode_tok_s']:.3f} vs repack {r8['decode_tok_s']:.3f}(打平,差异 <5%)")
-              dlines.append(f"- kleidiai_active(Q8_0) = {k8['kleidiai_active']}(source={k8['kleidiai_active_source']})")
-              dlines.append("- 对比 Q4_0(KleidiAI≈repack 打平):Q8_0 上 KleidiAI 是否能胜出是本轮 headline。")
-              dlines.append("")
-          dlines.append("## G5 内存 tie-break 说明")
-          dlines.append("- 决策表选每量化'最佳档'时,若两档 decode 差在噪声内(<5%),取峰值内存更低者。")
-          dlines.append("- 诚实体现'内存换速度'取舍(如 repack ~1.7× 峰值内存换速度)。")
-          dlines.append("")
-          dlines.append("## G7 公平性断言")
-          if len(ppl_records) == len(ppl_set):
-              dlines.append(f"- 4 份 perplexity JSON 的 n_chunks={ppl_chunks} / n_ctx={ppl_ctx} / wikitext_sha256 一致 ✓")
-          else:
-              dlines.append(f"- ⚠️ 仅 {len(ppl_records)}/{len(ppl_set)} 份 perplexity 完成,G7 断言跳过(可能 perplexity step 超时)")
-          dlines.append("")
-          # 收尾2: perplexity 误差棒重叠诚实说明(不重跑,措辞诚实化).
-          dlines.append("## perplexity 误差棒诚实说明(收尾2)")
-          dlines.append("- chunks=8 下三量化 PPL 误差棒 ±0.64~0.68,而量化间差值仅 0.1~0.6 —— 个体误差棒重叠。")
-          dlines.append("- 排序(Q8_0<Q4_K_M<Q4_0)符合量化理论,且三者同 chunk/同数据集配对测量,是可信的相对排序;")
-          dlines.append("  但在此分辨率下个体误差棒重叠,非精确质量差。量化取舍主由体积/速度/内存驱动。")
-          dlines.append("- 这不是数据问题,是措辞诚实度问题(不重跑);T4 看板 PPL 一律带 ± 误差棒。")
-          dlines.append("")
-          # Q4_K_M decode 差异显著性诚实标注(总监裁定:不用重跑,但要把 stddev 贴出佐证).
-          if ("kleidiai_only","q4_k_m") in records and ("norepack","q4_k_m") in records:
-              k_qkm = records[("kleidiai_only","q4_k_m")]
-              n_qkm = records[("norepack","q4_k_m")]
-              diff_qkm = k_qkm['decode_tok_s'] - n_qkm['decode_tok_s']
-              comb_sigma = (k_qkm['decode_stddev']**2 + n_qkm['decode_stddev']**2) ** 0.5
-              if comb_sigma > 0:
-                  sigma_qkm = abs(diff_qkm) / comb_sigma
-                  pp_diff_pct = (k_qkm['prefill_tok_s'] - n_qkm['prefill_tok_s']) / n_qkm['prefill_tok_s'] * 100
-                  dlines.append("## Q4_K_M decode 差异显著性(诚实标注,不重跑)")
-                  dlines.append(f"- kleidiai_only decode {k_qkm['decode_tok_s']:.3f} ± {k_qkm['decode_stddev']:.3f} vs norepack {n_qkm['decode_tok_s']:.3f} ± {n_qkm['decode_stddev']:.3f}")
-                  dlines.append(f"- diff={diff_qkm:.3f}, combined σ={comb_sigma:.3f} → {sigma_qkm:.1f}σ({'显著(>3σ)' if sigma_qkm > 3 else '噪声内'})")
-                  dlines.append(f"- prefill diff: kleidiai_only {k_qkm['prefill_tok_s']:.3f} vs norepack {n_qkm['prefill_tok_s']:.3f}(差 {pp_diff_pct:.2f}%, 噪声内)")
-                  decode_diff_pct = diff_qkm / n_qkm['decode_tok_s'] * 100
-                  dlines.append(f"- decode delta 在 within-run 尺度 {sigma_qkm:.1f}σ(本轮 {'+' if diff_qkm>=0 else ''}{decode_diff_pct:.2f}%),但 T2↔T3 跨轮对照(T2 -0.83% / T3 首轮 +4.65% 5.3σ / 本轮 {'+' if diff_qkm>=0 else ''}{decode_diff_pct:.2f}% {sigma_qkm:.1f}σ)符号与幅度波动大,揭示 within-run stddev(5 reps)低估真实跨轮方差;成因未定(跨轮方差/次要布局),KleidiAI 确未接管(三重确认:源码覆盖空 + prefill 噪声内 + source=no_runtime_takeover_kquant_noop)。")
-                  dlines.append("")
-          # 收尾1: PMU 探针实测结论(T3b Performix feasibility,从 pmu_probe.log 实读).
-          import os as _os
-          if _os.path.exists("pmu_probe.log"):
-              _pmu_text = pathlib.Path("pmu_probe.log").read_text(encoding='utf-8')
-              _has_pmu = "armv8_pmuv3_0" in _pmu_text
-              _has_spe = ("arm_spe" in _pmu_text) and ("(no arm_spe)" not in _pmu_text)
-              _perf_ok = "perf_stat: OK" in _pmu_text
-              dlines.append("## PMU 探针实测结论(T3b Performix feasibility,收尾1)")
-              dlines.append(f"- /sys/bus/event_source/devices 含 armv8_pmuv3_0: {_has_pmu}(PMU 硬件设备是否暴露给 VM)")
-              dlines.append(f"- arm_spe(SPE)存在: {_has_spe}")
-              dlines.append(f"- perf stat cycles/instructions: {'OK(真数值)' if _perf_ok else 'FAILED(硬件计数器访问被 perf_event_paranoid 拦,<not supported>)'}")
-              if _perf_ok and _has_spe:
-                  dlines.append("- 结论:PMU + SPE 均可用 → T5 Performix 可接入(顺手抓一档真计数器)。")
-              elif _perf_ok:
-                  dlines.append("- 结论:PMU 硬件计数器可用但 SPE 不在 → Performix SPE 功能不可用,可用 perf stat 真计数器做瓶颈分解。")
-              else:
-                  dlines.append("- 结论:PMU 硬件设备暴露给 VM 但访问被拦;SPE 完全不在 → Performix SPE 功能不可用,锁 fallback 叙事(perf stat 软件事件 + llama-bench -v + 消融链当瓶颈分解)。")
-              dlines.append("- 完整 pmu_probe.log 见 artifact(全程 AI 参赛佐证)。")
-              dlines.append("")
-          pathlib.Path(f'results/{ts}-decision-table.md').write_text("\n".join(dlines)+"\n", encoding='utf-8')
-          print(f"=== decision table written ===")
-
+          # ===== Summary (Phase 1+2 results — for CI log visibility) =====
           print("=== ALL 15 RESULTS SUMMARY ===")
           for (V,Q),r in records.items():
               print(f"{V:16s} {Q:8s} pp={r['prefill_tok_s']:.3f} tg={r['decode_tok_s']:.3f} ttft={r['ttft_ms']:.1f} mem={r['peak_mem_mb']:.1f} k_comp={r['kleidiai_compiled']} k_act={r['kleidiai_active']} k_src={r['kleidiai_active_source']} off={r['kleidiai_tensors_offloaded']} r_act={r['repack_active']}")
@@ -732,6 +561,15 @@ jobs:
           for (V,Q),r in ppl_records.items():
               print(f"{V:16s} {Q:8s} PPL={r['perplexity']:.4f} +/- {r['perplexity_stddev']:.5f}")
           PYEOF
+
+          # ===== Phase 3+4: comparison MDs + decision table + manifest + dashboard =====
+          # T4: extracted to scripts/assemble_results.py (single source of truth).
+          # bench.yml + run_bench.sh share the same assembly logic — zero divergence.
+          # P1: writes docs/data/dashboard.json (self-contained, dashboard fetches same dir).
+          # P2: compute_headlines() single computation for all headline numbers.
+          # P3①: manifest asserts every listed file exists.
+          python3 scripts/assemble_results.py "$TS" --pmu-log pmu_probe.log
+
 
       - name: Upload artifacts (full audit trail — 全程 AI 参赛佐证)
         if: always()
@@ -758,7 +596,7 @@ jobs:
           # Purge previous-round matrix files, keep T1 baseline (20260630T162334Z-*) + .gitkeep.
           # Eliminates stale probe JSON so downstream T4 dashboard never reads superseded data.
           git ls-files 'results/*-q4_*.json' 'results/*-q8_*.json' 'results/*-comparison-*.md' 'results/*-perplexity-*.json' 'results/*-decision-*.md' | grep -v '^results/20260630T162334Z-' | xargs -r git rm -f --ignore-unmatch
-          git add results/*.json results/*-comparison-*.md results/*-decision-*.md 2>/dev/null || true
+          git add results/*.json results/*-comparison-*.md results/*-decision-*.md results/manifest.json docs/data/dashboard.json 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "no new result files to commit"
           else

@@ -1,0 +1,48 @@
+{
+  "latest_timestamp": "20260702T133344Z",
+  "runs": {
+    "20260702T133344Z": {
+      "cpu_model": "Neoverse-N2 (implementer=0x41 part=0xd49)",
+      "llama_commit": "fabde3bf5136940eb03821aa2490e2360093965b",
+      "runner_os": "Ubuntu 24.04.4 LTS",
+      "compiler": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+      "cpu_features": "fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16",
+      "speed_files": [
+        "20260702T133344Z-kleidiai-q4_0.json",
+        "20260702T133344Z-kleidiai-q4_k_m.json",
+        "20260702T133344Z-kleidiai-q8_0.json",
+        "20260702T133344Z-kleidiai_only-q4_0.json",
+        "20260702T133344Z-kleidiai_only-q4_k_m.json",
+        "20260702T133344Z-kleidiai_only-q8_0.json",
+        "20260702T133344Z-naive-q4_0.json",
+        "20260702T133344Z-naive-q4_k_m.json",
+        "20260702T133344Z-naive-q8_0.json",
+        "20260702T133344Z-norepack-q4_0.json",
+        "20260702T133344Z-norepack-q4_k_m.json",
+        "20260702T133344Z-norepack-q8_0.json",
+        "20260702T133344Z-repack-q4_0.json",
+        "20260702T133344Z-repack-q4_k_m.json",
+        "20260702T133344Z-repack-q8_0.json"
+      ],
+      "perplexity_files": [
+        "20260702T133344Z-perplexity-kleidiai-q4_0.json",
+        "20260702T133344Z-perplexity-naive-q4_0.json",
+        "20260702T133344Z-perplexity-naive-q4_k_m.json",
+        "20260702T133344Z-perplexity-naive-q8_0.json"
+      ],
+      "decision_table": "20260702T133344Z-decision-table.md",
+      "comparisons": [
+        "20260702T133344Z-comparison-q4_k_m.md",
+        "20260702T133344Z-comparison-q4_0.md",
+        "20260702T133344Z-comparison-q8_0.md"
+      ],
+      "pmu_summary": {
+        "armv8_pmuv3_0_present": true,
+        "arm_spe_present": false,
+        "perf_stat_ok": false,
+        "conclusion": "Performix SPE unavailable; fallback narrative locked"
+      }
+    }
+  },
+  "generated_at": "2026-07-02T16:22:55Z"
+}
