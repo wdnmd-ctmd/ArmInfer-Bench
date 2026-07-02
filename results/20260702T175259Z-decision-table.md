@@ -1,15 +1,15 @@
 # 选哪个量化:决策表(Qwen2.5-1.5B-Instruct, wikitext-2 PPL, --chunks 8 -c 512)
 
-runner cpu: Neoverse-N2 (implementer=0x41 part=0xd49) | llama_commit: fabde3bf5136940eb03821aa2490e2360093965b | timestamp: 20260702T154003Z
+runner cpu: Neoverse-N2 (implementer=0x41 part=0xd49) | llama_commit: fabde3bf5136940eb03821aa2490e2360093965b | timestamp: 20260702T175259Z
 
 | quant | 体积MB | 最佳档 | prefill tok/s | decode tok/s | perplexity | 峰值内存MB(最佳档) | 最优优化路径 | PPL spot-check |
 |-------|--------|--------|---------------|--------------|------------|---------------------|-------------|----------------|
-| Q4_K_M | 1065.56 | kleidiai (G5 tie-break: 2 档 decode 差<5%, 取内存最低) | 87.303 | 33.403 | 11.2698 ± 0.68037 | 2065.7 | repack (1.20×) — KleidiAI no-op on k-quant | — |
-| Q4_0 | 1016.83 | kleidiai_only (G5 tie-break: 3 档 decode 差<5%, 取内存最低) | 129.269 | 36.757 | 11.3872 ± 0.68512 | 1853.1 | KleidiAI ≈ repack(打平,≈1.45×)— 仅凭 G5 内存优势(1853<1965MB)择 kleidiai_only | PASS (diff 0.045%) |
-| Q8_0 | 1806.77 | kleidiai (G5 tie-break: 2 档 decode 差<5%, 取内存最低) | 181.601 | 44.675 | 10.6823 ± 0.64232 | 3372.7 | KleidiAI (1.55×) > repack (1.39×) | — |
+| Q4_K_M | 1065.56 | kleidiai (G5 tie-break: 2 档 decode 差<5%, 取内存最低) | 87.036 | 32.907 | 11.2698 ± 0.68037 | 2065.7 | repack (1.20×) — KleidiAI no-op on k-quant | — |
+| Q4_0 | 1016.83 | kleidiai_only (G5 tie-break: 3 档 decode 差<5%, 取内存最低) | 129.107 | 35.705 | 11.3872 ± 0.68512 | 1853.4 | KleidiAI ≈ repack(打平,≈1.50×)— 仅凭 G5 内存优势(1853<1965MB)择 kleidiai_only | PASS (diff 0.045%) |
+| Q8_0 | 1806.77 | kleidiai (G5 tie-break: 2 档 decode 差<5%, 取内存最低) | 181.813 | 44.396 | 10.6823 ± 0.64232 | 3372.7 | KleidiAI (1.55×) > repack (1.44×) | — |
 
 ## Q8_0 KleidiAI vs repack(headline)
-- KleidiAI **>** repack:kleidiai_only decode 44.556 vs repack 40.038(KleidiAI 胜 11.3%)
+- KleidiAI **>** repack:kleidiai_only decode 43.092 vs repack 40.211(KleidiAI 胜 7.2%)
 - kleidiai_active(Q8_0) = True(source=verbose_log_primary_kernel)
 - 对比 Q4_0(KleidiAI≈repack 打平):Q8_0 上 KleidiAI 是否能胜出是本轮 headline。
 
@@ -27,10 +27,10 @@ runner cpu: Neoverse-N2 (implementer=0x41 part=0xd49) | llama_commit: fabde3bf51
 - 这不是数据问题,是措辞诚实度问题(不重跑);T4 看板 PPL 一律带 ± 误差棒。
 
 ## Q4_K_M decode 差异显著性(诚实标注,不重跑)
-- kleidiai_only decode 27.732 ± 0.152 vs norepack 27.538 ± 0.185
-- diff=0.194, combined σ=0.239 → 0.8σ(噪声内)
-- prefill diff: kleidiai_only 58.693 vs norepack 58.729(差 -0.06%, 噪声内)
-- decode delta 在 within-run 尺度 0.8σ(本轮 +0.70%),但 T2↔T3 跨轮对照(T2 -0.83% / T3 首轮 +4.65% 5.3σ / 本轮 +0.70% 0.8σ)符号与幅度波动大,揭示 within-run stddev(5 reps)低估真实跨轮方差;成因未定(跨轮方差/次要布局),KleidiAI 确未接管(三重确认:源码覆盖空 + prefill 噪声内 + source=no_runtime_takeover_kquant_noop)。
+- kleidiai_only decode 26.722 ± 0.121 vs norepack 27.484 ± 0.282
+- diff=-0.762, combined σ=0.307 → 2.5σ(噪声内)
+- prefill diff: kleidiai_only 58.526 vs norepack 58.843(差 -0.54%, 噪声内)
+- decode delta 在 within-run 尺度 2.5σ(本轮 -2.77%),但 T2↔T3 跨轮对照(T2 -0.83% / T3 首轮 +4.65% 5.3σ / 本轮 -2.77% 2.5σ)符号与幅度波动大,揭示 within-run stddev(5 reps)低估真实跨轮方差;成因未定(跨轮方差/次要布局),KleidiAI 确未接管(三重确认:源码覆盖空 + prefill 噪声内 + source=no_runtime_takeover_kquant_noop)。
 
 ## PMU 探针实测结论(T3b Performix feasibility,收尾1)
 - /sys/bus/event_source/devices 含 armv8_pmuv3_0: True(PMU 硬件设备是否暴露给 VM)
