@@ -5,7 +5,7 @@ runner cpu: Neoverse-N2 (implementer=0x41 part=0xd49) | llama_commit: fabde3bf51
 | quant | 体积MB | 最佳档 | prefill tok/s | decode tok/s | perplexity | 峰值内存MB(最佳档) | 最优优化路径 | PPL spot-check |
 |-------|--------|--------|---------------|--------------|------------|---------------------|-------------|----------------|
 | Q4_K_M | 1065.56 | kleidiai (G5 tie-break: 2 档 decode 差<3%, 取内存最低) | 87.113 | 33.301 | 11.2698 ± 0.68037 | 2062.0 | repack (1.25×) — KleidiAI no-op on k-quant | — |
-| Q4_0 | 1016.83 | kleidiai_only (G5 tie-break: 3 档 decode 差<3%, 取内存最低) | 129.175 | 36.214 | 11.3872 ± 0.68512 | 1853.3 | KleidiAI (1.45×) > repack (1.41×) | PASS (diff 0.045%) |
+| Q4_0 | 1016.83 | kleidiai_only (G5 tie-break: 3 档 decode 差<3%, 取内存最低) | 129.175 | 36.214 | 11.3872 ± 0.68512 | 1853.3 | KleidiAI ≈ repack(打平,≈1.41×)— 仅凭 G5 内存优势(1853<1965MB)择 kleidiai_only | PASS (diff 0.045%) |
 | Q8_0 | 1806.77 | kleidiai_only (G5 tie-break: 2 档 decode 差<3%, 取内存最低) | 182.288 | 44.504 | 10.6823 ± 0.64232 | 3363.8 | KleidiAI (1.56×) > repack (1.36×) | — |
 
 ## Q8_0 KleidiAI vs repack(headline)

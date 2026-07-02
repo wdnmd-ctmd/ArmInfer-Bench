@@ -200,6 +200,13 @@ llama_commit, timestamp
 
 每量化一行,列 = `quant | 体积MB | 最佳档 | prefill tok/s | decode tok/s | perplexity | 峰值内存MB(最佳档) | 最优优化路径 | PPL spot-check`。最佳档判据:decode tok/s 最高,若两档 decode 差<3% 取峰值内存更低者(G5)。附 Q8_0 KleidiAI vs repack headline insight + G5/G7 说明。
 
+**收尾诚实化措辞(T3 签收前裁定,T4 看板必须继承)**:
+
+- **收尾2 PPL 误差棒**:chunks=8 下三量化 PPL 误差棒 ±0.64~0.68,而量化间差值仅 0.1~0.6,个体误差棒重叠。决策表/看板 PPL 一律带 ± 误差棒,并附说明:"排序(Q8_0<Q4_K_M<Q4_0)符合量化理论,同 chunk/同数据集配对测量,是可信的相对排序;但此分辨率下个体误差棒重叠,非精确质量差。量化取舍主由体积/速度/内存驱动。"不重跑,措辞诚实化。
+- **收尾3 Q4_0 最优路径措辞**:Q4_0 上 KleidiAI(1.45×)与 repack(1.41×)差 3%(<5% 阈值),判为"打平",仅凭 G5 内存优势(1853<1965MB)择 kleidiai_only。真正的"KleidiAI 胜出"只在 Q8_0(+15.3% decode)。best_path 阈值 1.05(5%),不让 Q4_0 蹭 Q8_0 headline。
+- **Q4_K_M decode 差异显著性**:kleidiai_only vs norepack decode 差 5.3σ(统计显著,非噪声),但 KleidiAI 未接管(三重确认:源码覆盖空 + prefill 0.38% 噪声内 + source=no_runtime_takeover_kquant_noop)。差异最可能是编译进 KleidiAI 代码导致的二进制布局扰动效应(kleidiai_compiled=true, nm 447)。结论"未接管"不改,但 stddev 显著性如实标注。
+- **收尾1 PMU 探针实测(T3b)**:`/sys/bus/event_source/devices` 含 `armv8_pmuv3_0`(PMU 硬件设备暴露给 VM)但 `perf stat` 硬件计数器访问被 `perf_event_paranoid` 拦(`<not supported>`);`arm_spe`(SPE)完全不在。结论:Performix SPE 功能在 GHA Arm64 VM 不可用,T5 锁 fallback 叙事(perf stat 软件事件 + llama-bench -v + 消融链当瓶颈分解)。完整 `pmu_probe.log` 见 artifact。
+
 ## 后续阶段
 
 - **T2**(已完成):五档构建矩阵 × 两量化同机对照(2D:5 variants × Q4_K_M+Q4_0,`build_variant.sh` + 激活探针 4 字段运行时真检测)——实现完整 R3,严格遵守 NF4 同机对照(同 job/同 runner 连续跑完,结论只用 speedup ratio,分母按量化各自 naive)。G1 探针交叉验证 / G2 Q4_0 双优化交互 / G3 50min 红线。T2 实测两条 insight(已采信):Q4_0 上 KleidiAI 相对 repack 边际收益≈0;repack 以 ~1.7× 峰值内存换速度。

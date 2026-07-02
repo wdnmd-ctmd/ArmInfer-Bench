@@ -17,3 +17,6 @@ build/
 # 日志/临时
 *.log
 tmp/
+
+# CI artifact 临时下载(本地审查用,不入库)
+*.zip

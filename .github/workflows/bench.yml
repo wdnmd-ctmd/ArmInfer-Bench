@@ -626,12 +626,19 @@ jobs:
               kai_gain = records[("kleidiai_only",Q)]['decode_tok_s'] / records[("norepack",Q)]['decode_tok_s']
               if Q == "q4_k_m":
                   best_path = f"repack ({repack_gain:.2f}×) — KleidiAI no-op on k-quant"
-              elif kai_gain > repack_gain * 1.02:
+              elif kai_gain > repack_gain * 1.05:
                   best_path = f"KleidiAI ({kai_gain:.2f}×) > repack ({repack_gain:.2f}×)"
-              elif repack_gain > kai_gain * 1.02:
+              elif repack_gain > kai_gain * 1.05:
                   best_path = f"repack ({repack_gain:.2f}×) > KleidiAI ({kai_gain:.2f}×)"
               else:
-                  best_path = f"repack ≈ KleidiAI (≈{repack_gain:.2f}×,打平)"
+                  # 收尾3: 阈值 1.05(5%)让 Q4_0(kai 1.45 vs repack 1.41,差 3%)落入打平分支.
+                  # 打平时仅凭 G5 内存优势择档,不让 Q4_0 蹭 Q8_0 的 headline. 真正"KleidiAI 胜出"只在 Q8_0.
+                  kai_mem = records[("kleidiai_only",Q)]['peak_mem_mb']
+                  rep_mem = records[("repack",Q)]['peak_mem_mb']
+                  if kai_mem < rep_mem:
+                      best_path = f"KleidiAI ≈ repack(打平,≈{repack_gain:.2f}×)— 仅凭 G5 内存优势({kai_mem:.0f}<{rep_mem:.0f}MB)择 kleidiai_only"
+                  else:
+                      best_path = f"KleidiAI ≈ repack(打平,≈{repack_gain:.2f}×)— 仅凭 G5 内存优势({rep_mem:.0f}<{kai_mem:.0f}MB)择 repack"
               # PPL column
               if ("naive",Q) in ppl_records:
                   pr = ppl_records[("naive",Q)]
@@ -673,6 +680,49 @@ jobs:
           else:
               dlines.append(f"- ⚠️ 仅 {len(ppl_records)}/{len(ppl_set)} 份 perplexity 完成,G7 断言跳过(可能 perplexity step 超时)")
           dlines.append("")
+          # 收尾2: perplexity 误差棒重叠诚实说明(不重跑,措辞诚实化).
+          dlines.append("## perplexity 误差棒诚实说明(收尾2)")
+          dlines.append("- chunks=8 下三量化 PPL 误差棒 ±0.64~0.68,而量化间差值仅 0.1~0.6 —— 个体误差棒重叠。")
+          dlines.append("- 排序(Q8_0<Q4_K_M<Q4_0)符合量化理论,且三者同 chunk/同数据集配对测量,是可信的相对排序;")
+          dlines.append("  但在此分辨率下个体误差棒重叠,非精确质量差。量化取舍主由体积/速度/内存驱动。")
+          dlines.append("- 这不是数据问题,是措辞诚实度问题(不重跑);T4 看板 PPL 一律带 ± 误差棒。")
+          dlines.append("")
+          # Q4_K_M decode 差异显著性诚实标注(总监裁定:不用重跑,但要把 stddev 贴出佐证).
+          if ("kleidiai_only","q4_k_m") in records and ("norepack","q4_k_m") in records:
+              k_qkm = records[("kleidiai_only","q4_k_m")]
+              n_qkm = records[("norepack","q4_k_m")]
+              diff_qkm = k_qkm['decode_tok_s'] - n_qkm['decode_tok_s']
+              comb_sigma = (k_qkm['decode_stddev']**2 + n_qkm['decode_stddev']**2) ** 0.5
+              if comb_sigma > 0:
+                  sigma_qkm = abs(diff_qkm) / comb_sigma
+                  pp_diff_pct = (k_qkm['prefill_tok_s'] - n_qkm['prefill_tok_s']) / n_qkm['prefill_tok_s'] * 100
+                  dlines.append("## Q4_K_M decode 差异显著性(诚实标注,不重跑)")
+                  dlines.append(f"- kleidiai_only decode {k_qkm['decode_tok_s']:.3f} ± {k_qkm['decode_stddev']:.3f} vs norepack {n_qkm['decode_tok_s']:.3f} ± {n_qkm['decode_stddev']:.3f}")
+                  dlines.append(f"- diff={diff_qkm:.3f}, combined σ={comb_sigma:.3f} → {sigma_qkm:.1f}σ({'显著(>3σ)' if sigma_qkm > 3 else '噪声内'})")
+                  dlines.append(f"- prefill diff: kleidiai_only {k_qkm['prefill_tok_s']:.3f} vs norepack {n_qkm['prefill_tok_s']:.3f}(差 {pp_diff_pct:.2f}%, 噪声内)")
+                  dlines.append("- 结论不变:KleidiAI 在 Q4_K_M 未接管(三重确认:源码覆盖空 + prefill 噪声内 + source=no_runtime_takeover_kquant_noop)。")
+                  dlines.append(f"- decode 差异 {sigma_qkm:.1f}σ 统计显著但非 KleidiAI 接管所致 —— 最可能是编译进 KleidiAI 代码导致的二进制布局扰动效应(kleidiai_compiled=true, nm 计数 {k_qkm['kleidiai_compiled_nm_count']})。")
+                  dlines.append("- 诚实重判:数据违反'噪声'假设,如实标注;但'未接管'结论由探针+源码 definitive 确认,不改。")
+                  dlines.append("")
+          # 收尾1: PMU 探针实测结论(T3b Performix feasibility,从 pmu_probe.log 实读).
+          import os as _os
+          if _os.path.exists("pmu_probe.log"):
+              _pmu_text = pathlib.Path("pmu_probe.log").read_text(encoding='utf-8')
+              _has_pmu = "armv8_pmuv3_0" in _pmu_text
+              _has_spe = ("arm_spe" in _pmu_text) and ("(no arm_spe)" not in _pmu_text)
+              _perf_ok = "perf_stat: OK" in _pmu_text
+              dlines.append("## PMU 探针实测结论(T3b Performix feasibility,收尾1)")
+              dlines.append(f"- /sys/bus/event_source/devices 含 armv8_pmuv3_0: {_has_pmu}(PMU 硬件设备是否暴露给 VM)")
+              dlines.append(f"- arm_spe(SPE)存在: {_has_spe}")
+              dlines.append(f"- perf stat cycles/instructions: {'OK(真数值)' if _perf_ok else 'FAILED(硬件计数器访问被 perf_event_paranoid 拦,<not supported>)'}")
+              if _perf_ok and _has_spe:
+                  dlines.append("- 结论:PMU + SPE 均可用 → T5 Performix 可接入(顺手抓一档真计数器)。")
+              elif _perf_ok:
+                  dlines.append("- 结论:PMU 硬件计数器可用但 SPE 不在 → Performix SPE 功能不可用,可用 perf stat 真计数器做瓶颈分解。")
+              else:
+                  dlines.append("- 结论:PMU 硬件设备暴露给 VM 但访问被拦;SPE 完全不在 → Performix SPE 功能不可用,锁 fallback 叙事(perf stat 软件事件 + llama-bench -v + 消融链当瓶颈分解)。")
+              dlines.append("- 完整 pmu_probe.log 见 artifact(全程 AI 参赛佐证)。")
+              dlines.append("")
           pathlib.Path(f'results/{ts}-decision-table.md').write_text("\n".join(dlines)+"\n", encoding='utf-8')
           print(f"=== decision table written ===")
 
