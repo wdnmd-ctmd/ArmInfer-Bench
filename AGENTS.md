@@ -10,7 +10,7 @@
 
 ## 本轮范围
 
-**W1 = T0 + T1**(已完成,naive baseline 锚点已立)。**W2 = T2**(已完成:五档 × 两量化同机对照,探针干净 + G1 一致性断言)。**W3 = T3**(已完成:三量化 × 五档 + perplexity 质量列 + Performix PMU 探针,总监已签收)。事实来源:`.trae/specs/bootstrap-arm-infer-bench/spec.md`。T4–T6 为后续阶段。
+**W1 = T0 + T1**(已完成,naive baseline 锚点已立)。**W2 = T2**(已完成:五档 × 两量化同机对照,探针干净 + G1 一致性断言)。**W3 = T3**(已完成:三量化 × 五档 + perplexity 质量列 + Performix PMU 探针,总监已签收)。**W4 = T4**(已完成:一键基准 `run_bench.sh` + 静态看板 GitHub Pages 上线 + golden-diff 0 行,总监已签收)。**W5 = T4b + T5**(进行中:T4b naive vs kleidiai serving 并发基准 + T5 配方/模板/Performix fallback/AGENTS 同步)。事实来源:`.trae/specs/bootstrap-arm-infer-bench/spec.md`。T6 为后续阶段。
 
 ## 目录结构
 
@@ -20,12 +20,26 @@
 /AGENTS.md                    项目目标、目录、Arm64 构建运行验证说明、五档定义
 /.gitignore                   忽略 third_party/llama.cpp 与其 build/ 等
 /.gitattributes               强制 LF 行尾(shell/yml 跨平台)
-/scripts/run_bench.sh         一键:构建→下载模型→基准→输出 JSON  (T4)
-/scripts/build_variant.sh     按档位参数化构建 llama.cpp            (T2)
-/scripts/fetch_llamacpp.sh    浅拉固定 commit 的 llama.cpp 到 third_party/ (T1 本轮)
-/.github/workflows/bench.yml  arm64 CI 工作流(concurrency + 路径限定 + action 固定版本) (T1 本轮)
-/results/                     基准 JSON 输出(含 .gitkeep)
-/dashboard/                   静态看板占位(含 .gitkeep)          (T4)
+/scripts/run_bench.sh         一键:构建→下载模型→基准→输出 JSON        (T4 已落地)
+/scripts/build_variant.sh     按档位参数化构建 llama.cpp(第 4 参 BUILD_SERVER) (T2/T4b)
+/scripts/fetch_llamacpp.sh    浅拉固定 commit 的 llama.cpp 到 third_party/
+/scripts/assemble_results.py  装配 speed+ppl → comparison MD + decision table + dashboard.json (T4,S2 冻结)
+/scripts/test_assemble_results.py  assemble_results.py 冒烟测试(P3③ 防回归)    (T4)
+/scripts/test_dashboard_dom.js     看板 DOM 渲染冒烟(Node,无浏览器)           (T4)
+/scripts/serving_prompts.json      8 条 in-repo serving prompt(Sc:tokenize≤512) (T4b)
+/scripts/bench_server.py      纯 stdlib serving 负载生成器(M2)+ VmHWM(M3)+ 软告警(Sa) (T4b)
+/scripts/_merge_serving_to_dashboard.py  serving 数据注入 dashboard(S2,不动 assemble) (T4b)
+/scripts/test_bench_server.py merge 脚本冒烟测试(可选 P3③)                    (T4b)
+/.github/workflows/bench.yml  arm64 CI(M1 拆两次 commit + serving 步 + continue-on-error)
+/results/                     速度 + perplexity + serving JSON + comparison/decision MD + manifest.json
+/docs/                        静态看板(GitHub Pages,纯前端 vanilla JS,无构建) (T4 已上线)
+/docs/index.html              看板入口(+ 导航至 T5 三文档,Sd blob view 链接)
+/docs/app.js                  看板渲染逻辑(含 renderServing 区段)             (T4/T4b)
+/docs/style.css               看板样式
+/docs/data/dashboard.json     看板数据源(15 speed + 4 ppl + headlines + serving_records)
+/docs/optimization-recipe.md  Arm64 LLM 推理优化配方(S3:不硬编码 headline)      (T5)
+/docs/migration-template.md   迁移到其他模型的逐步模板                            (T5)
+/docs/performix-fallback-report.md  Performix SPE 不可用 + fallback 叙事报告      (T5)
 /third_party/llama.cpp        运行时浅拉(gitignored),其下 build/ 也 gitignored
 ```
 
@@ -211,6 +225,7 @@ llama_commit, timestamp
 
 - **T2**(已完成):五档构建矩阵 × 两量化同机对照(2D:5 variants × Q4_K_M+Q4_0,`build_variant.sh` + 激活探针 4 字段运行时真检测)——实现完整 R3,严格遵守 NF4 同机对照(同 job/同 runner 连续跑完,结论只用 speedup ratio,分母按量化各自 naive)。G1 探针交叉验证 / G2 Q4_0 双优化交互 / G3 50min 红线。T2 实测两条 insight(已采信):Q4_0 上 KleidiAI 相对 repack 边际收益≈0;repack 以 ~1.7× 峰值内存换速度。
 - **T3**(已完成):多量化对照(Q4_0/Q4_K_M/Q8_0 + perplexity 质量列)——实现 R4。三量化 × 五档 = 15 速度基准 + 4 份 perplexity(naive×3 + kleidiai-Q4_0 spot-check)+ "选哪个量化"决策表(G5 内存 tie-break,阈值 5%)+ Q8_0 KleidiAI vs repack headline(KleidiAI +12.5% decode 胜)+ Performix PMU 探针(T3b:SPE 不可用,锁 fallback)。护栏 G4/G5/G6/G7 全过。T3 实测 insights(已采信):Q8_0 上 KleidiAI 真胜 repack(+12.5% decode);Q4_0 上 KleidiAI≈repack 打平(差 3%,仅凭 G5 内存优势择 kleidiai_only);Q4_K_M 上 KleidiAI no-op(decode delta 跨轮波动大,within-run stddev 低估真实跨轮方差,未接管)。
-- **T4**:一键基准 `run_bench.sh` + 静态看板——实现 R5。
-- **T5**:Arm Performix 接入 + 迁移模板 + 优化配方——实现 R6/R7。
+- **T4**(已完成):一键基准 `run_bench.sh` + 静态看板(GitHub Pages 上线)——实现 R5。`assemble_results.py` 装配 15 speed + 4 ppl → comparison MD + decision table + `docs/data/dashboard.json`(P1 自包含 / P2 单源 headlines / P3 健壮性三补);golden-diff 0 行签收。看板:https://wdnmd-ctmd.github.io/ArmInfer-Bench/。
+- **T4b**(进行中):llama-server 并发服务基准——补 R5 serving 维度。naive vs kleidiai × Q4_0/Q8_0 × 并发 1/2/4/6 = 16 测量点;S1 wall-clock 吞吐 + S5 TTFT p50/mean/max;`_merge_serving_to_dashboard.py` 注入(S2 assemble 冻结);M1 拆两次 commit 保核心数据 / M2 纯 stdlib / M3 VmHWM 杀进程前读。
+- **T5**(进行中):优化配方 + 迁移模板 + Performix fallback 报告 + AGENTS.md 同步——实现 R6/R7。`docs/optimization-recipe.md`(S3 不硬编码 headline)+ `docs/migration-template.md` + `docs/performix-fallback-report.md`(T3b SPE 不可用,锁 fallback)。
 - **T6**:三段式 README 终稿 + ≤3min 演示视频脚本——实现 R8 终稿。
