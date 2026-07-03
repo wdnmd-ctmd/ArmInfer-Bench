@@ -398,65 +398,56 @@ def main():
         "n_requests": args.n_requests,
     }
 
-    # Port conflict guard.
-    if is_port_listening(args.host, args.port):
-        print("::warning::port {} occupied, attempting pkill -f llama-server".format(args.port))
-        subprocess.run(["pkill", "-f", "llama-server"], check=False)
-        time.sleep(1.0)
-        if is_port_listening(args.host, args.port):
-            print("::error::port {} still occupied after pkill".format(args.port))
-            sys.exit(1)
-
-    # 3. Start server.
-    server_cmd = [
-        args.server_bin,
-        "--model", args.model,
-        "--host", args.host,
-        "--port", str(args.port),
-        "--threads", str(args.threads),
-        "--ctx-size", str(ctx_size),
-        "--parallel", str(args.parallel),
-        "--cont-batching",
-    ]
-    print("::group::llama-server ({}/{})".format(args.variant, args.quant))
-    print("cmd: " + " ".join(server_cmd))
-    proc = subprocess.Popen(
-        server_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
+    # State variables (declared before try so except/finally can access them).
     measurements = []
     peak_mem_mb = None
     peak_mem_source = "unavailable"
     prompt_token_counts = []
-    skipped_due_to_token_budget = False
-    server_pid = proc.pid
+    proc = None
+    server_pid = None
+    status = "crashed"  # default; set to "ok"/"server_unhealthy"/etc. on known paths
 
     try:
+        # Port conflict guard.
+        if is_port_listening(args.host, args.port):
+            print("::warning::port {} occupied, attempting pkill -f llama-server".format(args.port))
+            subprocess.run(["pkill", "-f", "llama-server"], check=False)
+            time.sleep(1.0)
+            if is_port_listening(args.host, args.port):
+                raise RuntimeError("port {} still occupied after pkill".format(args.port))
+
+        # 3. Start server (inside try so FileNotFoundError/PermissionError is caught).
+        if not os.path.exists(args.server_bin):
+            raise FileNotFoundError("server binary not found: {}".format(args.server_bin))
+        server_cmd = [
+            args.server_bin,
+            "--model", args.model,
+            "--host", args.host,
+            "--port", str(args.port),
+            "--threads", str(args.threads),
+            "--ctx-size", str(ctx_size),
+            "--parallel", str(args.parallel),
+            "--cont-batching",
+        ]
+        print("::group::llama-server ({}/{})".format(args.variant, args.quant))
+        print("cmd: " + " ".join(server_cmd))
+        proc = subprocess.Popen(
+            server_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        server_pid = proc.pid
+
         # 4. Wait for /health.
         if not wait_for_health(args.host, args.port, timeout_s=60):
             print("::error::server failed to become healthy; aborting {}".format(args.output))
-            # Still try to read VmHWM before kill (M3).
+            # M3: read VmHWM before kill (proc/<pid> vanishes after kill).
             vmhwm_kb, peak_mem_source = read_vmhwm_kb(server_pid)
             if vmhwm_kb is not None:
                 peak_mem_mb = round(vmhwm_kb / 1024.0, 2)
-            # Dump server stdout for debugging.
-            try:
-                if proc.stdout:
-                    out = proc.stdout.read()
-                    if out:
-                        print("--- server output ---")
-                        print(out[:4000])
-            except Exception:
-                pass
-            kill_server(proc)
-            # Write a failure-record JSON so the merge step can still account for it.
-            write_output(args, server_args, prompt_set_sha256, n_prompts, prompt_token_counts,
-                         measurements, peak_mem_mb, peak_mem_source, ctx_size,
-                         max_concurrency, model_size_mb, model_sha256, status="server_unhealthy")
-            sys.exit(1)
+            status = "server_unhealthy"
+            sys.exit(1)  # triggers finally (kill + drain + write_output)
 
         # Sc: tokenize each prompt, verify <= 512.
         print("::group::Sc prompt token budget check")
@@ -473,18 +464,11 @@ def main():
             for i, n in over_budget:
                 print("::error::Sc: prompt[{}] tokenize={} > 512; would crowd max_tokens={}".format(
                     i, n, args.max_tokens))
-            skipped_due_to_token_budget = True
-            # Don't sys.exit — write a partial record and exit nonzero so CI sees the error
-            # but merge step still has a JSON to account for (G4: serving fail non-fatal).
             vmhwm_kb, peak_mem_source = read_vmhwm_kb(server_pid)
             if vmhwm_kb is not None:
                 peak_mem_mb = round(vmhwm_kb / 1024.0, 2)
-            kill_server(proc)
-            write_output(args, server_args, prompt_set_sha256, n_prompts, prompt_token_counts,
-                         measurements, peak_mem_mb, peak_mem_source, ctx_size,
-                         max_concurrency, model_size_mb, model_sha256,
-                         status="sc_prompt_over_512")
-            sys.exit(1)
+            status = "sc_prompt_over_512"
+            sys.exit(1)  # triggers finally (kill + drain + write_output)
 
         # 5. Warm-up (S4): 1 c=1 request, max_tokens=8, discard.
         print("::group::warmup (S4)")
@@ -539,16 +523,51 @@ def main():
         else:
             print("::warning::VmHWM read failed (source={}); peak_mem_mb=null".format(peak_mem_source))
 
-    finally:
-        # M3: kill server AFTER VmHWM read. Order is iron law.
-        kill_server(proc)
+        status = "ok"
 
-    # 9. Write serving JSON.
-    write_output(args, server_args, prompt_set_sha256, n_prompts, prompt_token_counts,
-                 measurements, peak_mem_mb, peak_mem_source, ctx_size,
-                 max_concurrency, model_size_mb, model_sha256, status="ok")
-    print("wrote {} (measurements={}, peak_mem_mb={}, source={})".format(
-        args.output, len(measurements), peak_mem_mb, peak_mem_source))
+    except SystemExit:
+        # sys.exit(1) from known failure paths (status already set). Let finally run.
+        raise
+    except Exception as e:
+        import traceback
+        print("::error::bench_server crashed: {}".format(e))
+        traceback.print_exc()
+        # Try to read VmHWM if server was started.
+        if server_pid is not None and peak_mem_mb is None:
+            vmhwm_kb, peak_mem_source = read_vmhwm_kb(server_pid)
+            if vmhwm_kb is not None:
+                peak_mem_mb = round(vmhwm_kb / 1024.0, 2)
+        # status stays "crashed"
+
+    finally:
+        # M3: kill server AFTER VmHWM read, BEFORE draining stdout. Order is iron law.
+        # Killing the server unblocks the stdout pipe (proc.stdout.read() deadlocks if
+        # the server is still alive — root cause of the first CI run producing 0 JSONs).
+        if proc is not None:
+            kill_server(proc)
+            # Drain stdout AFTER kill (pipe unblocks when process exits).
+            try:
+                out, _ = proc.communicate(timeout=5)
+                if out:
+                    print("--- server output (tail 4000 chars) ---")
+                    print(out[-4000:])
+            except Exception:
+                pass
+
+        # G4: ALWAYS write a JSON record so the merge step can account for this
+        # (variant, quant) even on failure. Without this, _merge_serving_to_dashboard.py
+        # finds 0 files and dashboard.json gets 0 serving_records.
+        write_output(args, server_args, prompt_set_sha256, n_prompts, prompt_token_counts,
+                     measurements, peak_mem_mb, peak_mem_source, ctx_size,
+                     max_concurrency, model_size_mb, model_sha256, status=status)
+        print("wrote {} (status={}, measurements={}, peak_mem_mb={}, source={})".format(
+            args.output, status, len(measurements), peak_mem_mb, peak_mem_source))
+
+    # Non-zero exit on any failure path so CI's `|| echo "::warning::"` triggers.
+    # (SystemExit from sys.exit(1) inside try already exits with code 1; this catches
+    # the "crashed" path where the exception was caught and handled.)
+    if status != "ok":
+        sys.exit(1)
 
 
 def write_output(args, server_args, prompt_set_sha256, n_prompts,
