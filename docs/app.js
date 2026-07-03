@@ -10,6 +10,11 @@
   var QUANTS = ['q4_k_m', 'q4_0', 'q8_0'];
   var QUANT_LABELS = { q4_k_m: 'Q4_K_M', q4_0: 'Q4_0', q8_0: 'Q8_0' };
 
+  // T4b serving: naive vs kleidiai × Q4_0/Q8_0 × conc 1/2/4/6
+  var SERVING_VARIANTS = ['naive', 'kleidiai'];
+  var SERVING_QUANTS = ['q4_0', 'q8_0'];
+  var CONCURRENCIES = [1, 2, 4, 6];
+
   var dashboard = null;
   var currentTs = null;
   var currentQuant = 'q4_k_m';
@@ -90,6 +95,7 @@
     renderDecisionTable(run);
     renderPMU(run);
     renderProbeMatrix(run);
+    renderServing(run);
   }
 
   function renderMeta(run) {
@@ -317,6 +323,99 @@
 
     html += '</tbody></table>';
     container.innerHTML = html;
+  }
+
+  // === T4b Serving: naive vs kleidiai × Q4_0/Q8_0 × conc 1/2/4/6 ===
+  function renderServing(run) {
+    var container = document.getElementById('serving-table');
+    var serving = run.serving_records || {};
+    var nRecords = Object.keys(serving).length;
+    if (nRecords === 0) {
+      container.innerHTML = '<p class="card-subtext">暂无 serving 数据(T4b 步未跑或超时,G4 不影响 15 速度 JSON)。</p>';
+      return;
+    }
+
+    var html = '';
+    SERVING_QUANTS.forEach(function (q) {
+      var naiveRec = serving['naive-' + q];
+      var kaiRec = serving['kleidiai-' + q];
+      html += '<h3 style="margin-top:24px;">' + QUANT_LABELS[q] + '</h3>';
+
+      if (!naiveRec && !kaiRec) {
+        html += '<p class="card-subtext">暂无 ' + QUANT_LABELS[q] + ' serving 数据。</p>';
+        return;
+      }
+
+      // Status badges (honest: if either failed, show it).
+      var statusLine = '<p class="card-subtext" style="margin-bottom:8px;">';
+      statusLine += 'naive: ' + (naiveRec ? ('status=' + esc(naiveRec.status || '?')) : 'missing');
+      statusLine += ' | kleidiai: ' + (kaiRec ? ('status=' + esc(kaiRec.status || '?')) : 'missing');
+      statusLine += '</p>';
+      html += statusLine;
+
+      html += '<div class="table-container"><table><thead><tr>';
+      html += '<th>并发</th>';
+      html += '<th>naive 吞吐 tok/s</th>';
+      html += '<th>kleidiai 吞吐 tok/s</th>';
+      html += '<th>kai/naive 吞吐比</th>';
+      html += '<th>naive TTFT p50 ms</th>';
+      html += '<th>kai TTFT p50 ms</th>';
+      html += '<th>naive 峰值内存 MB</th>';
+      html += '<th>kai 峰值内存 MB</th>';
+      html += '</tr></thead><tbody>';
+
+      CONCURRENCIES.forEach(function (c) {
+        var nM = findMeasurement(naiveRec, c);
+        var kM = findMeasurement(kaiRec, c);
+        var nThru = nM ? nM.throughput_tok_s : null;
+        var kThru = kM ? kM.throughput_tok_s : null;
+        var ratio = safeRatio(kThru, nThru);
+
+        html += '<tr>';
+        html += '<td>c=' + c + '</td>';
+        html += '<td>' + fmt3(nThru) + '</td>';
+        html += '<td>' + fmt3(kThru) + '</td>';
+        html += speedupCell(ratio);
+        html += '<td>' + fmt1(nM ? nM.ttft_p50_ms : null) + '</td>';
+        html += '<td>' + fmt1(kM ? kM.ttft_p50_ms : null) + '</td>';
+        // peak_mem is server-level (constant across concurrencies); show on every row for readability.
+        html += '<td>' + fmt1(naiveRec ? naiveRec.peak_mem_mb : null) + '</td>';
+        html += '<td>' + fmt1(kaiRec ? kaiRec.peak_mem_mb : null) + '</td>';
+        html += '</tr>';
+      });
+
+      html += '</tbody></table></div>';
+
+      // Per-quant summary: TTFT mean/max + token_count_source (S5/S7 honesty).
+      if (naiveRec || kaiRec) {
+        html += '<p class="card-subtext" style="margin-top:6px;font-size:12px;">';
+        if (naiveRec) {
+          var nm1 = findMeasurement(naiveRec, 1);
+          if (nm1) {
+            html += 'naive token_count_source=' + esc(nm1.token_count_source || '?');
+            html += '; TTFT mean/max(c=1)=' + fmt1(nm1.ttft_mean_ms) + '/' + fmt1(nm1.ttft_max_ms) + 'ms';
+          }
+        }
+        if (kaiRec) {
+          var km1 = findMeasurement(kaiRec, 1);
+          if (km1) {
+            html += ' | kleidiai token_count_source=' + esc(km1.token_count_source || '?');
+            html += '; TTFT mean/max(c=1)=' + fmt1(km1.ttft_mean_ms) + '/' + fmt1(km1.ttft_max_ms) + 'ms';
+          }
+        }
+        html += '</p>';
+      }
+    });
+
+    container.innerHTML = html;
+  }
+
+  function findMeasurement(servingRec, concurrency) {
+    if (!servingRec || !servingRec.measurements) return null;
+    for (var i = 0; i < servingRec.measurements.length; i++) {
+      if (servingRec.measurements[i].concurrency === concurrency) return servingRec.measurements[i];
+    }
+    return null;
   }
 
   // === Minimal Markdown renderer (handles tables, headers, bold, lists, code) ===

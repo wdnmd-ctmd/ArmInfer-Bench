@@ -134,6 +134,16 @@ section h2 {
   color: var(--text-dim);
   font-weight: 400;
 }
+.section-note {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.6;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
 
 /* === Headline cards === */
 .card-grid {
@@ -322,6 +332,37 @@ tr.best-row td {
   font-size: 13px;
   color: var(--text);
   line-height: 1.6;
+}
+
+/* === Docs navigation (Sd: blob view links) === */
+.docs-nav-list {
+  list-style: none;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+}
+.docs-nav-list li {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin: 10px 0;
+  padding-left: 16px;
+  position: relative;
+  line-height: 1.6;
+}
+.docs-nav-list li::before {
+  content: "▸";
+  position: absolute;
+  left: 0;
+  color: var(--accent);
+}
+.docs-nav-list a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+.docs-nav-list a:hover {
+  text-decoration: underline;
 }
 
 /* === Footnotes === */

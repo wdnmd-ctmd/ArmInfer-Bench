@@ -57,7 +57,36 @@
         <div class="table-container" id="probe-matrix"></div>
       </section>
 
-      <!-- g. 诚实说明脚注 -->
+      <!-- g. 并发服务 (T4b: llama-server naive vs kleidiai × Q4_0/Q8_0 × 1/2/4/6) -->
+      <section class="serving-section">
+        <h2>并发服务 <span class="subtitle">(llama-server,naive vs kleidiai)</span></h2>
+        <p class="section-note">
+          Q4_0 / Q8_0 × 并发 1/2/4/6。吞吐 = 总 token / wall-clock(S1);TTFT 报 p50/mean/max(S5,样本 N=16,max 标"样本最大值")。
+          峰值内存 = server 级 VmHWM(M3,杀进程前读,c=6 峰值,4 档共享)。
+        </p>
+        <div id="serving-table"></div>
+      </section>
+
+      <!-- h. 相关文档导航 (Sd: blob view 链接,Pages 不跑 Jekyll,MD 原文可读;站内 HTML 化留给 T6) -->
+      <section class="docs-nav">
+        <h2>相关文档</h2>
+        <ul class="docs-nav-list">
+          <li>
+            <a href="https://github.com/wdnmd-ctmd/ArmInfer-Bench/blob/main/docs/optimization-recipe.md" target="_blank" rel="noopener">优化配方</a>
+            — 三因子拆解 / 构建配方 / KleidiAI 覆盖 gotcha / naive 诚实标注 / PMU fallback
+          </li>
+          <li>
+            <a href="https://github.com/wdnmd-ctmd/ArmInfer-Bench/blob/main/docs/migration-template.md" target="_blank" rel="noopener">迁移模板</a>
+            — 7 步迁到其他模型 + 12 坑表(含 M1 拆两次 commit 防 timeout 丢数据)
+          </li>
+          <li>
+            <a href="https://github.com/wdnmd-ctmd/ArmInfer-Bench/blob/main/docs/performix-fallback-report.md" target="_blank" rel="noopener">Performix 报告</a>
+            — T3b 实测:SPE 不可用 + fallback 三件套(perf stat + llama-bench -v + 消融链)
+          </li>
+        </ul>
+      </section>
+
+      <!-- i. 诚实说明脚注 -->
       <footer class="footnotes">
         <h2>诚实说明</h2>
         <ul>
@@ -66,6 +95,7 @@
           <li><strong>PPL</strong>:误差棒 ±0.64~0.68 重叠,排序可信但非精确质量差;量化取舍主由体积/速度/内存驱动。</li>
           <li><strong>G5</strong>:decode 差 &lt;5% 取峰值内存更低者(内存换速度取舍)。</li>
           <li><strong>naive</strong>:armv8-a 基线,仍含 NEON(非零 SIMD),不开 i8mm/KleidiAI/repack。</li>
+          <li><strong>Serving (T4b)</strong>:可选维度,失败/超时不影响 15 速度 JSON(M1 拆两次 commit,G4)。数据缺失时本区段显示占位。吞吐口径 = 总 token / wall-clock(S1),非各请求吞吐之和。</li>
         </ul>
       </footer>
     </div>

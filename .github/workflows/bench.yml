@@ -1,11 +1,16 @@
-name: "Arm64 Bench (T3: 3-quant matrix + perplexity + PMU probe)"
+name: "Arm64 Bench (T3 matrix + perplexity + PMU + T4b serving)"
 
-# W3 = T3. Source of truth: .trae/specs/bootstrap-arm-infer-bench/spec.md
-# 五档 × 三量化(Q4_K_M/Q4_0/Q8_0) = 15 速度基准 + perplexity 质量列 + PMU 探针。
-# 严格遵守 NF4 同机对照(同 job 同 runner 连续跑完)。
+# W3 = T3 (15 speed + ppl + PMU). W5 = T4b (serving) + T5 (recipe/template/Performix).
+# Source of truth: .trae/specs/bootstrap-arm-infer-bench/spec.md
+# 五档 × 三量化(Q4_K_M/Q4_0/Q8_0) = 15 速度基准 + perplexity 质量列 + PMU 探针
+#   + T4b: naive vs kleidiai × Q4_0/Q8_0 × 并发 1/2/4/6 serving throughput/TTFT。
+# 严格遵守 NF4 同机对照(同 job 同 runner 连续跑完,serving 复用同机 build)。
 # 护栏:G1 探针交叉验证 / G2 Q4_0 双优化交互 / G3 50min 红线 /
-#       G4 结果不丢(perplexity timeout + always() commit)/ G5 内存 tie-break /
-#       G6 降级顺序固定 / G7 perplexity 公平性断言。
+#       G4 结果不丢(M1 拆两次 commit:commit#1 核心数据先落 main,commit#2 仅 serving)/
+#       G5 内存 tie-break / G6 降级顺序固定 / G7 perplexity 公平性断言。
+# T4b 约束:M2 纯 stdlib bench_server.py / M3 VmHWM 杀进程前读 / Sa 吞吐软告警 /
+#          S1 wall-clock 吞吐 / S4 warmup / S5 TTFT p50/mean/max / S6 8 in-repo prompts /
+#          S7 usage.completion_tokens / Sc prompt tokenize≤512。
 
 on:
   push:
@@ -66,6 +71,10 @@ jobs:
 
       - name: Run assemble_results.py smoke test (P3③)
         run: python scripts/test_assemble_results.py
+
+      - name: "Run test_bench_server.py smoke test (T4b P3③ serving merge injector)"
+        # T4b: 验证 _merge_serving_to_dashboard.py 注入逻辑不回归. <5s, 纯 stdlib, 无网络.
+        run: python scripts/test_bench_server.py
 
       - name: bash -n run_bench.sh (syntax check)
         run: bash -n scripts/run_bench.sh
@@ -322,6 +331,9 @@ jobs:
           TS=$(date -u +%Y%m%dT%H%M%SZ)
           echo "TS=$TS"
           export TS
+          # T4b: persist TS to GITHUB_ENV so serving bench + merge steps (which run in
+          # separate shells) can name/locate results/<TS>-serving-*.json consistently.
+          echo "TS=$TS" >> "$GITHUB_ENV"
           python3 - <<'PYEOF'
           import json, os, re, subprocess, pathlib, sys
 
@@ -571,6 +583,100 @@ jobs:
           python3 scripts/assemble_results.py "$TS" --pmu-log pmu_probe.log
 
 
+      - name: "Commit#1 core results to main (M1: before serving, protects 15 speed JSON)"
+        # M1+G4: commit core speed+ppl+MD+manifest+dashboard BEFORE serving steps start,
+        # so a job-level 60min timeout (which cancels ALL steps incl. if:always) cannot lose
+        # the 15 speed JSONs. Serving's own timeout-minutes:15 only guards step-level timeout,
+        # not job-level. commit#1 lands core data first; commit#2 lands serving only.
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Purge previous-round matrix files, keep T1 baseline (20260630T162334Z-*) + .gitkeep.
+          # Eliminates stale probe JSON so downstream T4 dashboard never reads superseded data.
+          git ls-files 'results/*-q4_*.json' 'results/*-q8_*.json' 'results/*-comparison-*.md' 'results/*-perplexity-*.json' 'results/*-decision-*.md' | grep -v '^results/20260630T162334Z-' | xargs -r git rm -f --ignore-unmatch
+          # Core data: speed + ppl + comparison MD + decision MD + manifest + dashboard (no serving yet).
+          git add results/*.json results/*-comparison-*.md results/*-decision-*.md results/manifest.json docs/data/dashboard.json 2>/dev/null || true
+          # Explicitly exclude serving JSON (commit#2 handles those) — defense against half-written files.
+          git reset -- results/*-serving-*.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "commit#1: nothing to commit"
+          else
+            git commit -m "bench(T4): core speed+ppl+dashboard [skip ci] (commit#1 of M1, CI #${{ github.run_id }})"
+            git pull --rebase origin "$GITHUB_REF_NAME" || true
+            git push origin "HEAD:$GITHUB_REF_NAME"
+            echo "commit#1 landed core results:"
+            git show --stat HEAD
+          fi
+
+      - name: "Build naive+kleidiai WITH server (T4b, BUILD_SERVER=ON, ccache reuse)"
+        # T4b: build llama-server for naive + kleidiai only (2 variants, not full 5).
+        # Independent build dirs (build-<V>-server) avoid re-running cmake on matrix builds;
+        # ccache shares core libs, so only the server target link is new (~1-2min/variant).
+        run: |
+          for V in naive kleidiai; do
+            bash scripts/build_variant.sh "$V" third_party/llama.cpp "third_party/llama.cpp/build-$V-server" ON
+          done
+
+      - name: "Run serving bench (T4b: naive vs kleidiai × Q4_0/Q8_0 × conc 1/2/4/6)"
+        # G4: continue-on-error — serving failure must NOT fail the job (15 speed JSON
+        # already safe in commit#1). timeout-minutes:15 guards step-level timeout;
+        # job-level 60min guarded by commit#1 having already landed core data.
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          mkdir -p serving_logs
+          PORT=8080
+          for V in naive kleidiai; do
+            for Q in q4_0 q8_0; do
+              case "$Q" in
+                q4_0) MODEL="models/${GGUF_FILE_Q4_0}" ;;
+                q8_0) MODEL="models/${GGUF_FILE_Q8_0}" ;;
+              esac
+              SERVER_BIN="third_party/llama.cpp/build-$V-server/bin/llama-server"
+              echo "::group::serving $V $Q (port $PORT)"
+              python3 scripts/bench_server.py \
+                --variant "$V" --quant "$Q" --model "$MODEL" --server-bin "$SERVER_BIN" \
+                --concurrency 1,2,4,6 --max-tokens 128 --n-requests 16 \
+                --prompts scripts/serving_prompts.json \
+                --port "$PORT" --threads "${BENCH_THREADS}" \
+                --llama-commit "${LLAMA_COMMIT}" \
+                --output "results/${TS}-serving-${V}-${Q}.json" \
+                2> "serving_logs/serving_${V}__${Q}.stderr" || \
+                echo "::warning::serving $V/$Q failed (exit $?) — G4 non-fatal, commit#1 already has core data"
+              echo "::endgroup::"
+              PORT=$((PORT + 1))
+            done
+          done
+
+      - name: "Merge serving data into dashboard (T4b S2: assemble_results.py frozen)"
+        # S2: inject serving_records into dashboard.json WITHOUT touching assemble_results.py
+        # (golden-diff 0 lines preserved). continue-on-error: merge failure non-fatal (G4).
+        if: always()
+        continue-on-error: true
+        run: python3 scripts/_merge_serving_to_dashboard.py "$TS"
+
+      - name: "Commit#2 serving results to main (M1: after merge, serving-only)"
+        # M1: serving JSON + merged dashboard (now containing serving_records) land in commit#2.
+        # if: always() so we still attempt the commit even if serving/merge failed (the
+        # nothing-to-commit path handles the empty case). [skip ci] avoids re-triggering workflow.
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Purge previous-round serving files (no T1 baseline to preserve for serving).
+          git ls-files 'results/*-serving-*.json' | grep -v "^results/${TS}-serving-" | xargs -r git rm -f --ignore-unmatch
+          git add results/*-serving-*.json docs/data/dashboard.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "commit#2: nothing to commit (serving may have failed/timed out — G4 non-fatal)"
+          else
+            git commit -m "bench(T4b): serving data + merged dashboard [skip ci] (commit#2 of M1, CI #${{ github.run_id }})"
+            git pull --rebase origin "$GITHUB_REF_NAME" || true
+            git push origin "HEAD:$GITHUB_REF_NAME"
+            echo "commit#2 landed serving results:"
+            git show --stat HEAD
+          fi
+
       - name: Upload artifacts (full audit trail — 全程 AI 参赛佐证)
         if: always()
         uses: actions/upload-artifact@v4.4.3
@@ -582,27 +688,8 @@ jobs:
             results/*-decision-*.md
             bench_logs/
             ppl_logs/
+            serving_logs/
             pmu_probe.log
             third_party/llama.cpp/build-*/probe_build.txt
             third_party/llama.cpp/build-*/cmake_config.log
           if-no-files-found: warn
-
-      - name: Commit results + comparison tables + decision table to repo (NF1 durable record)
-        # G4: if: always() so 15 speed JSONs are committed even if perplexity/PMU step failed.
-        if: always()
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Purge previous-round matrix files, keep T1 baseline (20260630T162334Z-*) + .gitkeep.
-          # Eliminates stale probe JSON so downstream T4 dashboard never reads superseded data.
-          git ls-files 'results/*-q4_*.json' 'results/*-q8_*.json' 'results/*-comparison-*.md' 'results/*-perplexity-*.json' 'results/*-decision-*.md' | grep -v '^results/20260630T162334Z-' | xargs -r git rm -f --ignore-unmatch
-          git add results/*.json results/*-comparison-*.md results/*-decision-*.md results/manifest.json docs/data/dashboard.json 2>/dev/null || true
-          if git diff --cached --quiet; then
-            echo "no new result files to commit"
-          else
-            git commit -m "T3 matrix: 5 variants × 3 quants + perplexity + PMU probe (CI #${{ github.run_id }})"
-            git pull --rebase origin "$GITHUB_REF_NAME" || true
-            git push origin "HEAD:$GITHUB_REF_NAME"
-            echo "committed T3 matrix results:"
-            git show --stat HEAD
-          fi

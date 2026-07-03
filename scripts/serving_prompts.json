@@ -1,0 +1,52 @@
+{
+  "_meta": {
+    "purpose": "T4b serving bench fixed prompt set (S6: in-repo, deterministic, temp=0)",
+    "n_prompts": 8,
+    "categories": ["code_qa", "fact", "creative", "summary", "math", "reasoning", "translation", "dialogue"],
+    "token_budget": "each prompt tokenize <= 512 tokens (Sc: verified at CI via /tokenize endpoint; c=6 x ctx=4096 -> 682 token/slot budget, prompt>512 would crowd max_tokens=128)",
+    "rotation": "requests pick prompt[i % 8]",
+    "sha256_field": "prompt_set_sha256 recorded into serving JSON for reproducibility"
+  },
+  "prompts": [
+    {
+      "id": "code_qa",
+      "category": "code_qa",
+      "prompt": "Explain what the following Python function does and identify any potential bugs or edge cases. Then suggest one improvement.\n\ndef merge_sorted(a, b):\n    result = []\n    i = j = 0\n    while i < len(a) and j < len(b):\n        if a[i] <= b[j]:\n            result.append(a[i])\n            i += 1\n        else:\n            result.append(b[j])\n            j += 1\n    result.extend(a[i:])\n    result.extend(b[j:])\n    return result\n\nPlease analyze step by step."
+    },
+    {
+      "id": "fact",
+      "category": "fact",
+      "prompt": "What is the difference between TCP and UDP? List at least four key differences in terms of connection model, reliability, ordering, and typical use cases. Give one concrete example of an application that uses each protocol and explain why that protocol is appropriate for the application."
+    },
+    {
+      "id": "creative",
+      "category": "creative",
+      "prompt": "Write a short science fiction scene (about 200 words) set on a research station orbiting a gas giant. The protagonist is an engineer who discovers that one of the station's autonomous repair drones has begun carving unfamiliar symbols onto the hull. Focus on atmosphere and the engineer's internal reaction. Do not resolve the mystery."
+    },
+    {
+      "id": "summary",
+      "category": "summary",
+      "prompt": "Summarize the following passage in three bullet points, then state the single most important claim in one sentence.\n\nLarge language models are trained on massive text corpora using a self-supervised objective that predicts the next token given preceding context. Despite this simple training signal, the resulting models exhibit a wide range of capabilities, including translation, code generation, and multi-step reasoning. However, their outputs can be confidently incorrect, a phenomenon often called hallucination. Hallucination is thought to arise from the model's lack of grounded world knowledge and its tendency to prioritize fluent, context-plausible continuations over factually accurate ones. Mitigation strategies include retrieval-augmented generation, reinforcement learning from human feedback, and post-hoc fact checking, but none fully eliminates the problem."
+    },
+    {
+      "id": "math",
+      "category": "math",
+      "prompt": "Solve the following problem step by step and give the final numerical answer.\n\nA train leaves station A traveling at 60 km/h. Two hours later, a second train leaves the same station traveling in the same direction at 90 km/h. How long does it take the second train to catch up to the first, and how far from the station are they at that moment? Show your reasoning."
+    },
+    {
+      "id": "reasoning",
+      "category": "reasoning",
+      "prompt": "Three people - Alice, Bob, and Carol - have different professions: doctor, engineer, and teacher. Each owns a different pet: cat, dog, and fish. Use the following clues to determine each person's profession and pet.\n\n1. The doctor does not own the cat.\n2. Bob is not the engineer.\n3. The engineer owns the fish.\n4. Carol owns the dog.\n5. Alice is not the teacher.\n\nExplain your reasoning step by step."
+    },
+    {
+      "id": "translation",
+      "category": "translation",
+      "prompt": "Translate the following English paragraph into Chinese, then briefly explain one translation difficulty you encountered and how you resolved it.\n\nThe quick brown fox jumps over the lazy dog. This sentence is famous because it contains every letter of the English alphabet at least once, making it useful for testing typography and keyboard displays."
+    },
+    {
+      "id": "dialogue",
+      "category": "dialogue",
+      "prompt": "You are a helpful assistant in a customer support chat for a cloud storage service. A user writes: 'I upgraded to the Pro plan yesterday but my storage quota still shows 15 GB instead of 1 TB. I tried logging out and back in but it did not help. Please help.' Respond in a friendly, professional tone, acknowledge the issue, propose two concrete troubleshooting steps, and tell the user what to do if the problem persists."
+    }
+  ]
+}

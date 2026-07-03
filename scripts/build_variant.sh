@@ -12,20 +12,35 @@
 # 运行时探针(repack_active / kleidiai_active / tensors_offloaded)由 bench.yml 用
 # `llama-bench -v` 日志采集,本脚本不负责。
 #
-# 用法:bash scripts/build_variant.sh <variant> <src_dir> <build_dir>
-#   variant ∈ {naive, norepack, repack, kleidiai_only, kleidiai}
+# 用法:bash scripts/build_variant.sh <variant> <src_dir> <build_dir> [build_server]
+#   variant      ∈ {naive, norepack, repack, kleidiai_only, kleidiai}
+#   build_server ∈ {ON, OFF} (默认 OFF;T4b serving 步传 ON 以增编 llama-server)
+#
+# T4b:第 4 位置参 BUILD_SERVER(默认 OFF,3 参调用零变化 → matrix 5 档不受影响)。
+#   ON 时翻 -DLLAMA_BUILD_SERVER=ON + --target 追加 llama-server + SERVER_BIN 校验。
+#   独立 build dir(build-<V>-server)避免重跑 cmake 污染 matrix build;ccache 共享核心库。
 
 set -euo pipefail
 
 VARIANT="${1:-}"
 SRC_DIR="${2:-}"
 BUILD_DIR="${3:-}"
+BUILD_SERVER="${4:-OFF}"
 
 if [[ -z "$VARIANT" || -z "$SRC_DIR" || -z "$BUILD_DIR" ]]; then
-    echo "usage: $0 <variant> <src_dir> <build_dir>" >&2
-    echo "  variant ∈ {naive, norepack, repack, kleidiai_only, kleidiai}" >&2
+    echo "usage: $0 <variant> <src_dir> <build_dir> [build_server]" >&2
+    echo "  variant      ∈ {naive, norepack, repack, kleidiai_only, kleidiai}" >&2
+    echo "  build_server ∈ {ON, OFF} (default OFF)" >&2
     exit 2
 fi
+
+case "$BUILD_SERVER" in
+    ON|OFF) ;;
+    *)
+        echo "::error::build_server must be ON or OFF, got '$BUILD_SERVER'" >&2
+        exit 2
+        ;;
+esac
 
 case "$VARIANT" in
     naive)
@@ -60,12 +75,13 @@ case "$VARIANT" in
 esac
 
 echo "::group::build_variant.sh: $VARIANT"
-echo "variant   : $VARIANT"
-echo "arch      : $ARCH"
-echo "kleidiai  : $KLEIDIAI"
-echo "repack    : $REPACK"
-echo "src_dir   : $SRC_DIR"
-echo "build_dir : $BUILD_DIR"
+echo "variant      : $VARIANT"
+echo "arch         : $ARCH"
+echo "kleidiai     : $KLEIDIAI"
+echo "repack       : $REPACK"
+echo "build_server : $BUILD_SERVER"
+echo "src_dir      : $SRC_DIR"
+echo "build_dir    : $BUILD_DIR"
 
 # --- Configure (capture full cmake config log for activation probe evidence) ---
 # GGML_LOG_LEVEL=DEBUG so runtime -v logs surface repack/kleidiai DEBUG messages (G1).
@@ -86,13 +102,18 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DLLAMA_BUILD_SERVER=OFF \
+    -DLLAMA_BUILD_SERVER="$BUILD_SERVER" \
     2>&1 | tee "$BUILD_DIR/cmake_config.log"
 
-# --- Build llama-bench + llama-perplexity targets (T3: perplexity quality column) ---
-# T2 only built llama-bench; T3 adds llama-perplexity for wikitext-2 PPL measurement.
-# ccache keeps core libs shared across variants; only the perplexity binary link is new (~10-20s/variant).
-cmake --build "$BUILD_DIR" --target llama-bench llama-perplexity -j"$(nproc)"
+# --- Build targets (T3: + perplexity; T4b: + server when BUILD_SERVER=ON) ---
+# T2 built llama-bench only; T3 adds llama-perplexity (wikitext-2 PPL); T4b adds llama-server
+# for serving benchmarks (only when 4th arg = ON). ccache keeps core libs shared across variants;
+# only the new binary's link step is added (~10-20s for perplexity, ~1-2min for server).
+BUILD_TARGETS="llama-bench llama-perplexity"
+if [[ "$BUILD_SERVER" == "ON" ]]; then
+    BUILD_TARGETS="$BUILD_TARGETS llama-server"
+fi
+cmake --build "$BUILD_DIR" --target $BUILD_TARGETS -j"$(nproc)"
 
 BENCH_BIN="$BUILD_DIR/bin/llama-bench"
 if [[ ! -x "$BENCH_BIN" ]]; then
@@ -109,6 +130,16 @@ if [[ ! -x "$PPL_BIN" ]]; then
 fi
 echo "=== llama-perplexity binary ==="
 "$PPL_BIN" --version || true
+
+if [[ "$BUILD_SERVER" == "ON" ]]; then
+    SERVER_BIN="$BUILD_DIR/bin/llama-server"
+    if [[ ! -x "$SERVER_BIN" ]]; then
+        echo "::error::llama-server not found at $SERVER_BIN (BUILD_SERVER=ON)" >&2
+        exit 1
+    fi
+    echo "=== llama-server binary ==="
+    "$SERVER_BIN" --version || true
+fi
 
 # ============================================================================
 # Build-time activation probes (G1). Runtime probes captured per-bench in bench.yml.
