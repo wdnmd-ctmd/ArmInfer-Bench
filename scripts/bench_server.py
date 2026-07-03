@@ -340,6 +340,62 @@ def kill_server(proc, timeout_s=5):
         pass
 
 
+# === SIGTERM emergency write (step-timeout protection) ===
+#
+# CI #28667394594 root cause: serving step hit 15min timeout-minutes, GitHub Actions
+# sent SIGTERM, Python's finally block did NOT execute (SIGTERM default-terminates the
+# interpreter without unwinding), so 0 serving JSONs were written → dashboard got
+# 0 serving_records. This handler is the double-insurance: on SIGTERM it performs an
+# emergency write_output() before os._exit(1) so the merge step always finds a JSON
+# (status=sigterm_killed / current status), even when the step is hard-cancelled.
+#
+# Python 3.5+ delivers signals to the main thread between bytecodes; if the main thread
+# is blocked in a C extension (e.g. socket.read), the signal interrupts it and the
+# handler runs. So this is reliable even during http.client readline().
+
+_emergency_state = {
+    'enabled': False,
+}
+
+
+def _sigterm_handler(signum, frame):
+    """Emergency JSON write on SIGTERM (step timeout). Then os._exit(1)."""
+    if not _emergency_state.get('enabled'):
+        # Either not started yet, or finally already wrote. Safe exit.
+        os._exit(1)
+    print("::warning::SIGTERM received (likely step timeout) — emergency JSON write", flush=True)
+    try:
+        # Try to read VmHWM if server was started and we haven't yet.
+        pid = _emergency_state.get('server_pid')
+        if pid and _emergency_state.get('peak_mem_mb') is None:
+            vmhwm_kb, src = read_vmhwm_kb(pid)
+            if vmhwm_kb is not None:
+                _emergency_state['peak_mem_mb'] = round(vmhwm_kb / 1024.0, 2)
+                _emergency_state['peak_mem_source'] = src
+        if _emergency_state.get('status') in (None, 'crashed'):
+            _emergency_state['status'] = 'sigterm_killed'
+        write_output(
+            _emergency_state['args'],
+            _emergency_state['server_args'],
+            _emergency_state['prompt_set_sha256'],
+            _emergency_state['n_prompts'],
+            _emergency_state['prompt_token_counts'],
+            _emergency_state['measurements'],
+            _emergency_state['peak_mem_mb'],
+            _emergency_state['peak_mem_source'],
+            _emergency_state['ctx_size'],
+            _emergency_state['max_concurrency'],
+            _emergency_state['model_size_mb'],
+            _emergency_state['model_sha256'],
+            _emergency_state['status'],
+        )
+        print("::warning::emergency JSON write done (status={})".format(
+            _emergency_state['status']), flush=True)
+    except Exception as e:
+        print("::error::emergency write failed: {}".format(e), flush=True)
+    os._exit(1)
+
+
 # === Main ===
 
 def main():
@@ -407,6 +463,28 @@ def main():
     server_pid = None
     status = "crashed"  # default; set to "ok"/"server_unhealthy"/etc. on known paths
 
+    # Register SIGTERM handler for step-timeout emergency write (double insurance).
+    # _emergency_state holds write_output args; 'measurements' is a list reference so
+    # the handler sees current contents even if SIGTERM arrives mid-concurrency-test.
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    _emergency_state.update({
+        'enabled': True,
+        'args': args,
+        'server_args': server_args,
+        'prompt_set_sha256': prompt_set_sha256,
+        'n_prompts': n_prompts,
+        'prompt_token_counts': prompt_token_counts,  # list ref, auto-updates
+        'measurements': measurements,                # list ref, auto-updates
+        'peak_mem_mb': None,
+        'peak_mem_source': 'unavailable',
+        'ctx_size': ctx_size,
+        'max_concurrency': max_concurrency,
+        'model_size_mb': model_size_mb,
+        'model_sha256': model_sha256,
+        'status': 'crashed',
+        'server_pid': None,
+    })
+
     try:
         # Port conflict guard.
         if is_port_listening(args.host, args.port):
@@ -438,6 +516,9 @@ def main():
             text=True,
         )
         server_pid = proc.pid
+        # Keep emergency state in sync so SIGTERM handler can read VmHWM if step
+        # timeout fires while we're mid-bench.
+        _emergency_state['server_pid'] = server_pid
 
         # 4. Wait for /health.
         if not wait_for_health(args.host, args.port, timeout_s=60):
@@ -447,6 +528,11 @@ def main():
             if vmhwm_kb is not None:
                 peak_mem_mb = round(vmhwm_kb / 1024.0, 2)
             status = "server_unhealthy"
+            # Mirror to emergency state (sys.exit raises SystemExit → finally runs; but
+            # if SIGTERM lands in this narrow window, handler needs the right values).
+            _emergency_state['peak_mem_mb'] = peak_mem_mb
+            _emergency_state['peak_mem_source'] = peak_mem_source
+            _emergency_state['status'] = status
             sys.exit(1)  # triggers finally (kill + drain + write_output)
 
         # Sc: tokenize each prompt, verify <= 512.
@@ -468,6 +554,9 @@ def main():
             if vmhwm_kb is not None:
                 peak_mem_mb = round(vmhwm_kb / 1024.0, 2)
             status = "sc_prompt_over_512"
+            _emergency_state['peak_mem_mb'] = peak_mem_mb
+            _emergency_state['peak_mem_source'] = peak_mem_source
+            _emergency_state['status'] = status
             sys.exit(1)  # triggers finally (kill + drain + write_output)
 
         # 5. Warm-up (S4): 1 c=1 request, max_tokens=8, discard.
@@ -522,8 +611,12 @@ def main():
             print("M3 VmHWM: {} kB = {} MB (source={})".format(vmhwm_kb, peak_mem_mb, peak_mem_source))
         else:
             print("::warning::VmHWM read failed (source={}); peak_mem_mb=null".format(peak_mem_source))
+        # Mirror to emergency state so SIGTERM handler sees the same peak_mem.
+        _emergency_state['peak_mem_mb'] = peak_mem_mb
+        _emergency_state['peak_mem_source'] = peak_mem_source
 
         status = "ok"
+        _emergency_state['status'] = 'ok'
 
     except SystemExit:
         # sys.exit(1) from known failure paths (status already set). Let finally run.
@@ -537,7 +630,10 @@ def main():
             vmhwm_kb, peak_mem_source = read_vmhwm_kb(server_pid)
             if vmhwm_kb is not None:
                 peak_mem_mb = round(vmhwm_kb / 1024.0, 2)
-        # status stays "crashed"
+        # Mirror to emergency state (status stays "crashed").
+        _emergency_state['peak_mem_mb'] = peak_mem_mb
+        _emergency_state['peak_mem_source'] = peak_mem_source
+        _emergency_state['status'] = status
 
     finally:
         # M3: kill server AFTER VmHWM read, BEFORE draining stdout. Order is iron law.
@@ -562,6 +658,8 @@ def main():
                      max_concurrency, model_size_mb, model_sha256, status=status)
         print("wrote {} (status={}, measurements={}, peak_mem_mb={}, source={})".format(
             args.output, status, len(measurements), peak_mem_mb, peak_mem_source))
+        # Disable emergency handler so a late SIGTERM doesn't double-write the JSON.
+        _emergency_state['enabled'] = False
 
     # Non-zero exit on any failure path so CI's `|| echo "::warning::"` triggers.
     # (SystemExit from sys.exit(1) inside try already exits with code 1; this catches

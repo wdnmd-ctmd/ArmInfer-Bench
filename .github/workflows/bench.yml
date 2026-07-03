@@ -622,6 +622,13 @@ jobs:
         # G4: continue-on-error — serving failure must NOT fail the job (15 speed JSON
         # already safe in commit#1). timeout-minutes:15 guards step-level timeout;
         # job-level 60min guarded by commit#1 having already landed core data.
+        #
+        # T4b timing budget (learned from CI #28667394594 where 16 req × 4 lvl × 4 combo
+        # exceeded 15min step timeout — naive decode ~19 tok/s → 128 tok / 19 = 6.7s/req):
+        #   n_requests=8 halves wall-clock → ~8.4min total (safe margin under 15min).
+        #   TTFT N=8 still yields p50/mean/max (S5); ttft_max_label auto-adapts.
+        # bench_server.py also registers a SIGTERM handler so even if step timeout fires,
+        # an emergency JSON write still runs (status=sigterm_killed) — double insurance.
         continue-on-error: true
         timeout-minutes: 15
         run: |
@@ -637,13 +644,18 @@ jobs:
               echo "::group::serving $V $Q (port $PORT)"
               python3 scripts/bench_server.py \
                 --variant "$V" --quant "$Q" --model "$MODEL" --server-bin "$SERVER_BIN" \
-                --concurrency 1,2,4,6 --max-tokens 128 --n-requests 16 \
+                --concurrency 1,2,4,6 --max-tokens 128 --n-requests 8 \
                 --prompts scripts/serving_prompts.json \
                 --port "$PORT" --threads "${BENCH_THREADS}" \
                 --llama-commit "${LLAMA_COMMIT}" \
                 --output "results/${TS}-serving-${V}-${Q}.json" \
                 2> "serving_logs/serving_${V}__${Q}.stderr" || \
                 echo "::warning::serving $V/$Q failed (exit $?) — G4 non-fatal, commit#1 already has core data"
+              # Diagnostic: surface stderr to step log (so failure root-cause is visible
+              # without needing to download artifacts; stderr file still uploaded).
+              echo "--- stderr (serving_${V}__${Q}) tail ---"
+              tail -40 "serving_logs/serving_${V}__${Q}.stderr" 2>/dev/null || echo "(no stderr file)"
+              echo "--- end stderr ---"
               echo "::endgroup::"
               PORT=$((PORT + 1))
             done
