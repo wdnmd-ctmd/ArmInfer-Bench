@@ -10,7 +10,7 @@
 
 ## 本轮范围
 
-**W1 = T0 + T1**(已完成,naive baseline 锚点已立)。**W2 = T2**(已完成:五档 × 两量化同机对照,探针干净 + G1 一致性断言)。**W3 = T3**(已完成:三量化 × 五档 + perplexity 质量列 + Performix PMU 探针,总监已签收)。**W4 = T4**(已完成:一键基准 `run_bench.sh` + 静态看板 GitHub Pages 上线 + golden-diff 0 行,总监已签收)。**W5 = T4b + T5**(进行中:T4b naive vs kleidiai serving 并发基准 + T5 配方/模板/Performix fallback/AGENTS 同步)。事实来源:`.trae/specs/bootstrap-arm-infer-bench/spec.md`。T6 为后续阶段。
+**W1 = T0 + T1**(已完成,naive baseline 锚点已立)。**W2 = T2**(已完成:五档 × 两量化同机对照,探针干净 + G1 一致性断言)。**W3 = T3**(已完成:三量化 × 五档 + perplexity 质量列 + Performix PMU 探针,总监已签收)。**W4 = T4**(已完成:一键基准 `run_bench.sh` + 静态看板 GitHub Pages 上线 + golden-diff 0 行,总监已签收)。**W5 = T4b + T5**(T4b 已完成:naive vs kleidiai serving 并发基准,CI #28698521281 全绿,16 测量点线上核验,总监已签收;T5 进行中:配方/模板/Performix fallback/AGENTS 同步/看板导航)。事实来源:`.trae/specs/bootstrap-arm-infer-bench/spec.md`。T6 为后续阶段。
 
 ## 目录结构
 
@@ -226,6 +226,6 @@ llama_commit, timestamp
 - **T2**(已完成):五档构建矩阵 × 两量化同机对照(2D:5 variants × Q4_K_M+Q4_0,`build_variant.sh` + 激活探针 4 字段运行时真检测)——实现完整 R3,严格遵守 NF4 同机对照(同 job/同 runner 连续跑完,结论只用 speedup ratio,分母按量化各自 naive)。G1 探针交叉验证 / G2 Q4_0 双优化交互 / G3 50min 红线。T2 实测两条 insight(已采信):Q4_0 上 KleidiAI 相对 repack 边际收益≈0;repack 以 ~1.7× 峰值内存换速度。
 - **T3**(已完成):多量化对照(Q4_0/Q4_K_M/Q8_0 + perplexity 质量列)——实现 R4。三量化 × 五档 = 15 速度基准 + 4 份 perplexity(naive×3 + kleidiai-Q4_0 spot-check)+ "选哪个量化"决策表(G5 内存 tie-break,阈值 5%)+ Q8_0 KleidiAI vs repack headline(KleidiAI +12.5% decode 胜)+ Performix PMU 探针(T3b:SPE 不可用,锁 fallback)。护栏 G4/G5/G6/G7 全过。T3 实测 insights(已采信):Q8_0 上 KleidiAI 真胜 repack(+12.5% decode);Q4_0 上 KleidiAI≈repack 打平(差 3%,仅凭 G5 内存优势择 kleidiai_only);Q4_K_M 上 KleidiAI no-op(decode delta 跨轮波动大,within-run stddev 低估真实跨轮方差,未接管)。
 - **T4**(已完成):一键基准 `run_bench.sh` + 静态看板(GitHub Pages 上线)——实现 R5。`assemble_results.py` 装配 15 speed + 4 ppl → comparison MD + decision table + `docs/data/dashboard.json`(P1 自包含 / P2 单源 headlines / P3 健壮性三补);golden-diff 0 行签收。看板:https://wdnmd-ctmd.github.io/ArmInfer-Bench/。
-- **T4b**(进行中):llama-server 并发服务基准——补 R5 serving 维度。naive vs kleidiai × Q4_0/Q8_0 × 并发 1/2/4/6 = 16 测量点;S1 wall-clock 吞吐 + S5 TTFT p50/mean/max;`_merge_serving_to_dashboard.py` 注入(S2 assemble 冻结);M1 拆两次 commit 保核心数据 / M2 纯 stdlib / M3 VmHWM 杀进程前读。
-- **T5**(进行中):优化配方 + 迁移模板 + Performix fallback 报告 + AGENTS.md 同步——实现 R6/R7。`docs/optimization-recipe.md`(S3 不硬编码 headline)+ `docs/migration-template.md` + `docs/performix-fallback-report.md`(T3b SPE 不可用,锁 fallback)。
+- **T4b**(已完成):llama-server 并发服务基准——补 R5 serving 维度。naive vs kleidiai × Q4_0/Q8_0 × 并发 1/2/4/6 = 16 测量点;S1 wall-clock 吞吐 + S5 TTFT p50/mean/max;`_merge_serving_to_dashboard.py` 注入(S2 assemble 冻结);M1 拆两次 commit 保核心数据 / M2 纯 stdlib / M3 VmHWM 杀进程前读。**实测参数**:`n_requests=4`(原 16/8 step timeout,降到 4 后 CI #28698521281 全绿)、step `timeout-minutes: 20`、增量 JSON 写(server 启动前占位 `status=starting` + 每并发级覆写 `running` + finally 覆写 `ok/crashed`,防 SIGKILL 丢数据)、SIGTERM handler 双保险。**有效并发档** = 1/2/4;c=6 因 `n_requests=4 < 并发上限` 退化(等价 c=4),如需真测 c=6 需 `n_requests≥6`。**headline insight**(定性,serving 放大远超离线):KleidiAI 收益随位宽增长——Q4_0 离线打平、Q8_0 离线 decode 真胜;serving 下批处理放大 prefill 优势,KleidiAI 价值在 serving 场景最强展示。repack/KleidiAI 属"用 ~1.7× 内存换速度"。
+- **T5**(进行中):优化配方 + 迁移模板 + Performix fallback 报告 + AGENTS.md 同步 + 看板导航——实现 R6/R7。`docs/optimization-recipe.md`(S3 不硬编码 headline,引用看板 verdict)+ `docs/migration-template.md` + `docs/performix-fallback-report.md`(T3b SPE 不可用,锁 fallback);`docs/index.html` 导航区指向 GitHub blob view(Sd,Pages 不渲染裸 .md)。
 - **T6**:三段式 README 终稿 + ≤3min 演示视频脚本——实现 R8 终稿。

@@ -61,7 +61,8 @@
       <section class="serving-section">
         <h2>并发服务 <span class="subtitle">(llama-server,naive vs kleidiai)</span></h2>
         <p class="section-note">
-          Q4_0 / Q8_0 × 并发 1/2/4/6。吞吐 = 总 token / wall-clock(S1);TTFT 报 p50/mean/max(S5,样本 N=16,max 标"样本最大值")。
+          Q4_0 / Q8_0 × 并发 1/2/4/6。吞吐 = 总 token / wall-clock(S1);TTFT 报 p50/mean/max(S5,样本 N=4,max 标"样本最大值")。
+          <strong>有效并发档 = 1/2/4;c=6 因 <code>n_requests=4 &lt; 并发上限 6</code> 退化(等价 c=4)</strong>,如需真测 c=6 需 <code>n_requests≥6</code>。
           峰值内存 = server 级 VmHWM(M3,杀进程前读,c=6 峰值,4 档共享)。
         </p>
         <div id="serving-table"></div>
