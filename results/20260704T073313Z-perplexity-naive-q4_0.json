@@ -1,17 +1,17 @@
 {
-  "variant": "kleidiai",
+  "variant": "naive",
   "quant": "Q4_0",
   "model": "Qwen2.5-1.5B-Instruct",
   "model_revision": "91cad51170dc346986eccefdc2dd33a9da36ead9",
   "model_sha256": "dcd819ff094852c38faba6873d8ff0c9d51eadb2844539e52042ae5d647bbfdb",
   "model_size_mb": 1016.83,
-  "perplexity": 11.3821,
-  "perplexity_stddev": 0.68486,
+  "perplexity": 11.3872,
+  "perplexity_stddev": 0.68512,
   "perplexity_formula": "Final estimate: PPL = X +/- Y (wikitext-2 test, --chunks 8 -c 512)",
   "n_chunks": 8,
   "n_ctx": 512,
   "chunks_tokens": 4096,
   "wikitext_sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08",
   "llama_commit": "fabde3bf5136940eb03821aa2490e2360093965b",
-  "timestamp": "20260703T165150Z"
+  "timestamp": "20260704T073313Z"
 }
