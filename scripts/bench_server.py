@@ -13,7 +13,7 @@
 #   Sa  S1 throughput soft-warning (peak(c>=2) > c=1), no hard assert / no crash
 #   S1  wall-clock throughput = total_tokens / (max(t_end) - min(t_post))
 #   S4  warm-up: 1 c=1 request, max_tokens=8, discarded
-#   S5  TTFT p50/mean/max (no p99/p95; n=16 too small); max labeled "样本 N=16 的最大值"
+#   S5  TTFT p50/mean/max (no p99/p95; n=4 too small); max labeled "样本 N=4 的最大值"
 #   S6  8 in-repo prompts; ctx=4096 >= 6x(512+128)+margin; server_args recorded
 #   S7  completion_tokens prefer final chunk usage.completion_tokens, else chunk count
 #   Sc  each prompt tokenize <= 512 (via /tokenize); >512 -> ::error:: + skip
@@ -22,7 +22,7 @@
 #   python3 scripts/bench_server.py \
 #     --variant naive --quant q4_0 \
 #     --model models/<gguf> --server-bin third_party/llama.cpp/build-naive-server/bin/llama-server \
-#     --concurrency 1,2,4,6 --max-tokens 128 --n-requests 16 \
+#     --concurrency 1,2,4,6 --max-tokens 128 --n-requests 4 \
 #     --prompts scripts/serving_prompts.json \
 #     --port 8080 --threads 4 \
 #     --output results/<ts>-serving-naive-q4_0.json
@@ -406,7 +406,7 @@ def main():
     ap.add_argument("--server-bin", required=True)
     ap.add_argument("--concurrency", default="1,2,4,6")
     ap.add_argument("--max-tokens", type=int, default=128)
-    ap.add_argument("--n-requests", type=int, default=16)
+    ap.add_argument("--n-requests", type=int, default=4)
     ap.add_argument("--prompts", default="scripts/serving_prompts.json")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--threads", type=int, default=4)
@@ -484,6 +484,15 @@ def main():
         'status': 'crashed',
         'server_pid': None,
     })
+
+    # Incremental JSON write #0: write a placeholder JSON BEFORE starting the server,
+    # so the merge step always finds a file even if the server fails to start or the
+    # process is SIGKILL'd before any concurrency level completes. The finally block
+    # (and each per-level write below) overwrites this with real data.
+    write_output(args, server_args, prompt_set_sha256, n_prompts, prompt_token_counts,
+                 measurements, peak_mem_mb, peak_mem_source, ctx_size,
+                 max_concurrency, model_size_mb, model_sha256, status="starting")
+    print("initial JSON written (status=starting) -> {}".format(args.output), flush=True)
 
     try:
         # Port conflict guard.
@@ -594,6 +603,16 @@ def main():
             elif c >= 2:
                 if peak_throughput_c_ge_2 is None or (m["throughput_tok_s"] or 0) > (peak_throughput_c_ge_2 or 0):
                     peak_throughput_c_ge_2 = m["throughput_tok_s"]
+
+            # Incremental JSON write after each concurrency level: if the process is
+            # SIGKILL'd mid-loop (step timeout), the last completed level's data is
+            # already on disk. status="running" signals partial; finally overwrites
+            # with "ok"/"crashed" on normal exit.
+            write_output(args, server_args, prompt_set_sha256, n_prompts, prompt_token_counts,
+                         measurements, peak_mem_mb, peak_mem_source, ctx_size,
+                         max_concurrency, model_size_mb, model_sha256, status="running")
+            print("  incremental JSON written (status=running, levels={})".format(
+                len(measurements)), flush=True)
 
         # Sa: S1 self-check (soft warning, no crash).
         if c1_throughput is not None and peak_throughput_c_ge_2 is not None:

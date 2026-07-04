@@ -620,17 +620,22 @@ jobs:
 
       - name: "Run serving bench (T4b: naive vs kleidiai × Q4_0/Q8_0 × conc 1/2/4/6)"
         # G4: continue-on-error — serving failure must NOT fail the job (15 speed JSON
-        # already safe in commit#1). timeout-minutes:15 guards step-level timeout;
+        # already safe in commit#1). timeout-minutes:20 guards step-level timeout;
         # job-level 60min guarded by commit#1 having already landed core data.
         #
-        # T4b timing budget (learned from CI #28667394594 where 16 req × 4 lvl × 4 combo
-        # exceeded 15min step timeout — naive decode ~19 tok/s → 128 tok / 19 = 6.7s/req):
-        #   n_requests=8 halves wall-clock → ~8.4min total (safe margin under 15min).
-        #   TTFT N=8 still yields p50/mean/max (S5); ttft_max_label auto-adapts.
-        # bench_server.py also registers a SIGTERM handler so even if step timeout fires,
-        # an emergency JSON write still runs (status=sigterm_killed) — double insurance.
+        # T4b timing budget (revised after CI #28672335580 where n_requests=8 STILL
+        # timed out at 15min — root cause: 4 combos run serially, each combo = server
+        # startup (~2min) + 4 levels × n_requests × ~9s/req (no batching guarantee);
+        # 4 combos × ~5min = ~20min > 15min):
+        #   n_requests=4 halves per-level time → ~2.5min/combo × 4 = ~10min bench
+        #   + 4 × 2min startup = ~8min → ~18min total. timeout=20min gives 2min margin.
+        #   Job budget: steps 1-19 take ~33min + 20min step20 + 1min = ~54min < 60min. ✓
+        #
+        # 0-JSON fix: bench_server.py now writes JSON incrementally (initial placeholder
+        # before server start + after each concurrency level), so even SIGKILL mid-loop
+        # leaves partial data on disk. SIGTERM handler is additional double-insurance.
         continue-on-error: true
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
           mkdir -p serving_logs
           PORT=8080
@@ -644,7 +649,7 @@ jobs:
               echo "::group::serving $V $Q (port $PORT)"
               python3 scripts/bench_server.py \
                 --variant "$V" --quant "$Q" --model "$MODEL" --server-bin "$SERVER_BIN" \
-                --concurrency 1,2,4,6 --max-tokens 128 --n-requests 8 \
+                --concurrency 1,2,4,6 --max-tokens 128 --n-requests 4 \
                 --prompts scripts/serving_prompts.json \
                 --port "$PORT" --threads "${BENCH_THREADS}" \
                 --llama-commit "${LLAMA_COMMIT}" \
