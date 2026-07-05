@@ -12,12 +12,47 @@
 #
 # 用法:
 #   bash scripts/run_bench.sh                     # 跑全流程(默认 5 档 × 3 量化)
+#   bash scripts/run_bench.sh -t 4 -p 512 -n 128 -r 5   # 显式 bench 参数(与 CI 对齐)
 #   VARIANTS="naive kleidiai" bash scripts/run_bench.sh   # 只跑部分档(调试用,会破坏 NF4 对照)
-#   THREADS=8 REPS=10 bash scripts/run_bench.sh   # 覆盖默认参数
+#   THREADS=8 REPS=10 bash scripts/run_bench.sh   # env 覆盖默认参数
 #
 # 非 aarch64 退出(Windows/x86 开发机不能跑,靠 CI 或评委 Arm64 复现)。
 
 set -euo pipefail
+
+# ============================================================================
+# 0a. 命令行参数解析(-t/-p/-n/-r,与 CI env 对齐;CLI 覆盖 env,env 覆盖默认)
+# ============================================================================
+usage() {
+    cat <<EOF
+用法:
+  bash scripts/run_bench.sh                          # 默认全流程(5 档 × 3 量化)
+  bash scripts/run_bench.sh -t 4 -p 512 -n 128 -r 5  # 显式 bench 参数(与 CI 对齐)
+  VARIANTS="naive kleidiai" bash scripts/run_bench.sh  # 只跑部分档(调试,破坏 NF4)
+  THREADS=8 REPS=10 bash scripts/run_bench.sh          # env 覆盖默认
+
+参数:
+  -t THREADS  线程数(默认 4,env THREADS)
+  -p PP       prefill tokens(默认 512,env PP)
+  -n TG       decode tokens(默认 128,env TG)
+  -r REPS     repeats(默认 5,env REPS)
+  -h          显示此帮助
+
+非 aarch64 退出(Windows/x86 开发机不能跑,靠 CI 或评委 Arm64 复现)。
+EOF
+}
+
+while getopts ":t:p:n:r:h" opt; do
+    case "$opt" in
+        t) THREADS="$OPTARG" ;;
+        p) PP="$OPTARG" ;;
+        n) TG="$OPTARG" ;;
+        r) REPS="$OPTARG" ;;
+        h) usage; exit 0 ;;
+        \?) echo "::error::unknown option: -$OPTARG" >&2; usage >&2; exit 2 ;;
+        :)  echo "::error::option -$OPTARG requires an argument" >&2; usage >&2; exit 2 ;;
+    esac
+done
 
 # ============================================================================
 # 0. 入口检测 + 环境变量默认值(与 CI env 完全对齐)

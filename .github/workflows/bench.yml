@@ -67,7 +67,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v6.0.3
 
       - name: Run assemble_results.py smoke test (P3③)
         run: python scripts/test_assemble_results.py
@@ -84,7 +84,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v6.0.3
 
       - name: CPU features self-evidence (T1.4 / NF4 anchor)
         id: cpu
@@ -132,7 +132,7 @@ jobs:
           echo "perf available: $(command -v perf || echo 'no')"
 
       - name: Configure ccache cache (shared across all 5 variants, G3)
-        uses: actions/cache@v4.2.0
+        uses: actions/cache@v6.1.0
         with:
           path: ~/.ccache
           key: ccache-arm64-matrix-${{ env.LLAMA_COMMIT }}-${{ github.sha }}
@@ -144,28 +144,28 @@ jobs:
 
       - name: Restore GGUF Q4_K_M cache
         id: gguf-q4km-cache
-        uses: actions/cache@v4.2.0
+        uses: actions/cache@v6.1.0
         with:
           path: models/${{ env.GGUF_FILE_Q4_K_M }}
           key: gguf-${{ env.GGUF_FILE_Q4_K_M }}-${{ env.GGUF_REV }}
 
       - name: Restore GGUF Q4_0 cache
         id: gguf-q40-cache
-        uses: actions/cache@v4.2.0
+        uses: actions/cache@v6.1.0
         with:
           path: models/${{ env.GGUF_FILE_Q4_0 }}
           key: gguf-${{ env.GGUF_FILE_Q4_0 }}-${{ env.GGUF_REV }}
 
       - name: Restore GGUF Q8_0 cache (T3 new)
         id: gguf-q80-cache
-        uses: actions/cache@v4.2.0
+        uses: actions/cache@v6.1.0
         with:
           path: models/${{ env.GGUF_FILE_Q8_0 }}
           key: gguf-${{ env.GGUF_FILE_Q8_0 }}-${{ env.GGUF_REV }}
 
       - name: Restore wikitext-2 cache (T3 perplexity dataset)
         id: wikitext-cache
-        uses: actions/cache@v4.2.0
+        uses: actions/cache@v6.1.0
         with:
           path: wikitext-2-raw/wiki.test.raw
           key: wikitext-2-raw-v1-test-raw
@@ -696,7 +696,7 @@ jobs:
 
       - name: Upload artifacts (full audit trail — 全程 AI 参赛佐证)
         if: always()
-        uses: actions/upload-artifact@v4.4.3
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: t3-matrix-${{ github.run_id }}
           path: |
