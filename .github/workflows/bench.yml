@@ -1,6 +1,7 @@
 name: "Arm64 Bench (T3 matrix + perplexity + PMU + T4b serving)"
 
 # W3 = T3 (15 speed + ppl + PMU). W5 = T4b (serving) + T5 (recipe/template/Performix).
+# W6 = T6 (三段式 README + 演示视频脚本 + 盲跑自测 + Node24 actions 升级).
 # Source of truth: .trae/specs/bootstrap-arm-infer-bench/spec.md
 # 五档 × 三量化(Q4_K_M/Q4_0/Q8_0) = 15 速度基准 + perplexity 质量列 + PMU 探针
 #   + T4b: naive vs kleidiai × Q4_0/Q8_0 × 并发 1/2/4/6 serving throughput/TTFT。
